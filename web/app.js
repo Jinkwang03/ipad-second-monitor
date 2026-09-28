@@ -135,6 +135,7 @@
   function onText(m) {
     switch (m.t) {
       case 'hello':
+        if (m.saveDir) saveDir = m.saveDir;
         store.set('key', key);
         if (params.get('key') !== key) {  // keep "Add to Home Screen" pointing at a working key
           params.set('key', key);
@@ -346,7 +347,7 @@
   }, { passive: false });
 
   // Keep iPadOS from scrolling, zooming, selecting or showing callouts.
-  const isUi = (t) => t instanceof Element && !!t.closest('#panel, #keyform, #handle, #notice');
+  const isUi = (t) => t instanceof Element && !!t.closest('#panel, #keyform, #handle, #notice, #transfer, #inbox');
   for (const type of ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange',
                       'gestureend', 'contextmenu', 'selectstart', 'dblclick']) {
     document.addEventListener(type, (e) => { if (!isUi(e.target)) e.preventDefault(); }, { passive: false });
@@ -512,6 +513,173 @@
     reconnectDelay = 500;
     connect();
   });
+
+  // -------------------------------------------------------- photos & files
+  // iPad -> PC: pick (or drag in) photos and files; they're uploaded to the PC's save folder.
+  // PC -> iPad: files copied on the PC (Ctrl+C in File Explorer) can be saved on the iPad.
+  const fileInput = $('file-input');
+  const transfer = $('transfer');
+  const inbox = $('inbox');
+  const dropEl = $('drop');
+  let saveDir = 'Downloads\\iPad Display';
+  let lastSaved = [];     // names the PC gave the files we just sent
+  let sending = false;
+
+  const apiUrl = (path, extra = {}) => `${path}?${new URLSearchParams({ key, ...extra })}`;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const fmtSize = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB'
+    : n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB';
+
+  function showTransfer(title, text, progress = null, actions = false) {
+    $('transfer-title').textContent = title;
+    $('transfer-text').textContent = text;
+    $('transfer-bar-wrap').hidden = progress === null;
+    $('transfer-bar').style.width = `${Math.round((progress || 0) * 100)}%`;
+    $('transfer-actions').hidden = !actions;
+    transfer.hidden = false;
+  }
+
+  function uploadOne(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', apiUrl('/upload', { name: file.name || 'photo.jpg', mtime: String(file.lastModified || '') }));
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
+      xhr.onload = () => {
+        if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+        else reject(new Error(xhr.status === 403 ? 'The access key was not accepted.' : `The PC answered ${xhr.status}.`));
+      };
+      xhr.onerror = () => reject(new Error('The connection to the PC was lost.'));
+      xhr.send(file);
+    });
+  }
+
+  async function sendFiles(files) {
+    if (sending || !files.length) return;
+    sending = true;
+    const total = files.reduce((sum, f) => sum + f.size, 0) || 1;
+    let done = 0;
+    const saved = [];
+    try {
+      for (const [i, file] of files.entries()) {
+        const title = files.length > 1 ? `Sending ${i + 1} of ${files.length} to the PC` : 'Sending to the PC';
+        showTransfer(title, file.name, done / total);
+        const result = await uploadOne(file, (loaded) => showTransfer(title, file.name, (done + loaded) / total));
+        done += file.size;
+        saved.push(result.name);
+      }
+      lastSaved = saved;
+      showTransfer(`Sent ${plural(saved.length, 'file')} to the PC`,
+                   `Saved in ${saveDir} (${fmtSize(done)}).`, null, true);
+    } catch (err) {
+      lastSaved = saved;
+      showTransfer('Sending stopped', `${err.message} ${saved.length} of ${files.length} files were saved.`,
+                   null, saved.length > 0);
+    } finally {
+      sending = false;
+    }
+  }
+
+  async function savedAction(action) {
+    try {
+      const r = await fetch(apiUrl('/saved'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, names: lastSaved }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `The PC answered ${r.status}.`);
+      $('transfer-text').textContent = action === 'copy'
+        ? `Copied ${plural(data.count, 'file')}. On the PC, press Ctrl+V to paste into a folder or app.`
+        : 'Opened File Explorer on the PC.';
+    } catch (err) {
+      $('transfer-text').textContent = `The PC couldn't do that: ${err.message}`;
+    }
+  }
+
+  $('btn-send').addEventListener('click', () => { panel.hidden = true; fileInput.click(); });
+  fileInput.addEventListener('change', () => {
+    const files = [...fileInput.files];
+    fileInput.value = '';
+    sendFiles(files);
+  });
+  $('btn-show-pc').addEventListener('click', () => savedAction('show'));
+  $('btn-copy-pc').addEventListener('click', () => savedAction('copy'));
+  $('transfer-close').addEventListener('click', () => { transfer.hidden = true; });
+
+  // Drag photos in from the Photos or Files app (Split View / Stage Manager).
+  let dragDepth = 0;
+  const carriesFiles = (e) => !!e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files');
+  document.addEventListener('dragenter', (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    dropEl.hidden = false;
+  });
+  document.addEventListener('dragover', (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  document.addEventListener('dragleave', (e) => {
+    if (!carriesFiles(e)) return;
+    if (--dragDepth <= 0) { dragDepth = 0; dropEl.hidden = true; }
+  });
+  document.addEventListener('drop', (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    dropEl.hidden = true;
+    sendFiles([...e.dataTransfer.files]);
+  });
+
+  function showInbox(message, files = []) {
+    const list = $('inbox-list');
+    list.textContent = '';
+    const photos = files.some((f) => f.image);
+    $('inbox-msg').textContent = message || (photos
+      ? 'Touch and hold a photo, then tap "Save to Photos". Download saves a file to the Files app (Downloads).'
+      : 'Download saves a file to the Files app (Downloads).');
+    for (const f of files) {
+      const item = document.createElement('div');
+      item.className = 'item';
+      if (f.image) {
+        const img = document.createElement('img');
+        img.src = apiUrl(`/clipboard/${f.id}`);
+        img.alt = f.name;
+        item.append(img);
+      }
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const name = document.createElement('span');
+      name.textContent = f.name;
+      const size = document.createElement('small');
+      size.textContent = fmtSize(f.size);
+      const link = document.createElement('a');
+      link.className = 'button';
+      link.href = apiUrl(`/clipboard/${f.id}`, { dl: '1' });
+      link.setAttribute('download', f.name);
+      link.textContent = 'Download';
+      meta.append(name, size, link);
+      item.append(meta);
+      list.append(item);
+    }
+    inbox.hidden = false;
+  }
+
+  $('btn-receive').addEventListener('click', async () => {
+    panel.hidden = true;
+    showInbox('Checking what is copied on the PC…');
+    try {
+      const r = await fetch(apiUrl('/clipboard'));
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `The PC answered ${r.status}.`);
+      if (data.files.length) showInbox(null, data.files);
+      else if (data.folders) showInbox('Only folders are copied on the PC. Open the folder, select the files inside and press Ctrl+C, then tap "Get from PC" again.');
+      else showInbox('Nothing is copied on the PC. In File Explorer, select files and press Ctrl+C, then tap "Get from PC" again.');
+    } catch (err) {
+      showInbox(`Couldn't check the PC: ${err.message}`);
+    }
+  });
+  $('inbox-close').addEventListener('click', () => { inbox.hidden = true; });
 
   function formatRate(bytesPerSec) {
     return bytesPerSec >= 1e6 ? (bytesPerSec / 1e6).toFixed(1) + ' MB/s' : Math.round(bytesPerSec / 1e3) + ' KB/s';

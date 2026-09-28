@@ -77,7 +77,90 @@ body {
   text-align: center;
 }
 
-#status[hidden], #keyform[hidden], #panel[hidden], #stats[hidden], #notice[hidden], #fs-hint[hidden] { display: none; }
+#status[hidden], #keyform[hidden], #panel[hidden], #stats[hidden], #notice[hidden], #fs-hint[hidden],
+#transfer[hidden], #inbox[hidden], #drop[hidden], [hidden] { display: none !important; }
+
+/* ---- photos & files ---- */
+
+.section { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.section-title { margin-bottom: 8px; color: var(--muted); font-size: 13px; }
+#panel .section .buttons { margin-top: 0; }
+
+#transfer {
+  left: 50%;
+  bottom: max(20px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  width: min(460px, calc(100vw - 32px));
+  box-sizing: border-box;
+  padding: 14px 16px;
+  z-index: 12;
+}
+
+#transfer .row, #inbox .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+#transfer p { margin: 2px 0 10px; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+#transfer .buttons { display: flex; gap: 10px; }
+#transfer .buttons button { flex: 1; }
+
+.bar { height: 6px; margin-bottom: 10px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.bar > div { width: 0; height: 100%; background: var(--accent); transition: width 0.15s; }
+
+#inbox {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  box-sizing: border-box;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  z-index: 12;
+}
+
+#inbox p { margin: 2px 0 12px; color: var(--muted); font-size: 14px; }
+#inbox-list { display: grid; gap: 10px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+#inbox .item { display: flex; align-items: center; gap: 12px; }
+#inbox .meta { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
+#inbox .meta span { overflow-wrap: anywhere; }
+#inbox .meta small { color: var(--muted); }
+
+/* Photos here can be touched and held for iPadOS's "Save to Photos". */
+#inbox img {
+  flex: none;
+  width: 104px;
+  height: 104px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #111;
+  -webkit-touch-callout: default;
+  -webkit-user-select: auto;
+  user-select: auto;
+}
+
+a.button {
+  display: inline-block;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+#drop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  border: 4px dashed var(--accent);
+  background: rgba(56, 189, 248, 0.18);
+  color: #fff;
+  font-size: 24px;
+  font-weight: 600;
+  pointer-events: none;
+}
 
 #status p { margin: 12px 0 0; white-space: pre-line; }
 

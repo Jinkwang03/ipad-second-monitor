@@ -15,6 +15,7 @@ import io
 import itertools
 import json
 import logging
+import os
 import re
 import secrets
 import sys
@@ -23,6 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 from aiohttp import WSMsgType, web
@@ -37,13 +39,16 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.1"
+VERSION = "1.2"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
 KEY_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 ALL_INTERFACES = ("0.0.0.0", "::", "")
 NETWORK_CHECK = 5.0     # seconds between checks for Wi-Fi / hotspot changes
+DEFAULT_SAVE_DIR = Path.home() / "Downloads" / "iPad Display"
+IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp", ".tif", ".tiff"}
+RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 MAX_INFLIGHT = 2        # frames sent but not yet drawn by the iPad; keeps latency low on slow Wi-Fi
 REFINE_DELAY = 0.3      # a region must be still this long before it is re-sent sharp
@@ -87,6 +92,10 @@ class Hub:
         self.shapes: dict[int, dict] = {}
         self.mirror_hint = ""                         # why we mirror instead of extending, if we do
         self.mdns: mdns.MdnsResponder | None = None   # answers <name>.local on the local network
+        self.offered: dict[str, str] = {}             # id -> path of files copied on the PC, for the iPad
+
+    def key_ok(self, value: str) -> bool:
+        return not self.key or secrets.compare_digest(value.encode(), self.key.encode())
 
     # ---- sessions -------------------------------------------------------
 
@@ -478,7 +487,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     hub: Hub = request.app["hub"]
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1 << 20, compress=False)
     await ws.prepare(request)
-    if hub.key and not secrets.compare_digest(request.query.get("key", ""), hub.key):
+    if not hub.key_ok(request.query.get("key", "")):
         log.warning("Rejected a connection from %s with a wrong key", request.remote)
         await ws.close(code=4001, message=b"wrong key")
         return ws
@@ -488,7 +497,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     tasks = [asyncio.ensure_future(session.frame_writer()), asyncio.ensure_future(session.cursor_writer())]
     try:
         caps = hub.injector.caps if hub.injector else {}
-        await session.send_json({"t": "hello", "v": VERSION, "caps": caps})
+        await session.send_json({"t": "hello", "v": VERSION, "caps": caps,
+                                 "saveDir": friendly_path(hub.args.save_dir)})
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 try:
@@ -504,6 +514,130 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         if session.greeted:
             log.info("iPad disconnected (%s)", session.peer)
     return ws
+
+
+# ---- moving photos and files between the iPad and the PC ------------------
+
+def safe_filename(name: str) -> str:
+    """A plain file name that can only land inside the save folder and is valid on Windows."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip(" .")
+    stem, dot, ext = name.partition(".")
+    if not stem or stem.upper() in RESERVED_NAMES:
+        name = f"file_{stem}{dot}{ext}" if stem else f"file{dot}{ext}"
+    if len(name) > 150:
+        root, ext = os.path.splitext(name)
+        name = root[:150 - len(ext)] + ext
+    return name
+
+
+def unique_path(path: Path) -> Path:
+    """`path`, or "name (2).ext", "name (3).ext", ... if it already exists."""
+    if not path.exists():
+        return path
+    for n in itertools.count(2):
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+
+
+def friendly_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def human_size(n: int) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def check_key(request: web.Request) -> Hub:
+    hub: Hub = request.app["hub"]
+    if not hub.key_ok(request.query.get("key", "")):
+        raise web.HTTPForbidden(text="wrong key")
+    return hub
+
+
+async def handle_upload(request: web.Request) -> web.Response:
+    """iPad -> PC: the request body is one file, streamed straight to the save folder."""
+    hub = check_key(request)
+    folder: Path = hub.args.save_dir
+    folder.mkdir(parents=True, exist_ok=True)
+    name = safe_filename(request.query.get("name", "")) or "file"
+    partial = folder / f".{secrets.token_hex(6)}.part"
+    size = 0
+    try:
+        with open(partial, "wb") as f:
+            async for chunk in request.content.iter_chunked(1 << 20):
+                f.write(chunk)
+                size += len(chunk)
+        final = unique_path(folder / name)
+        os.replace(partial, final)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    try:  # keep the photo's own date (the iPad sends milliseconds since 1970)
+        stamp = int(request.query.get("mtime", "")) / 1000
+        os.utime(final, (stamp, stamp))
+    except (ValueError, OSError, OverflowError):
+        pass
+    log.info("Received %s (%s) from %s -> %s", final.name, human_size(size), request.remote, folder)
+    return web.json_response({"name": final.name, "size": size})
+
+
+async def handle_saved(request: web.Request) -> web.Response:
+    """Act on files the iPad just sent: show them in File Explorer or copy them for Ctrl+V."""
+    hub = check_key(request)
+    if not IS_WINDOWS:
+        return web.json_response({"error": "only available on Windows"}, status=501)
+    data = await request.json()
+    folder: Path = hub.args.save_dir
+    paths = [folder / safe_filename(str(n)) for n in data.get("names", [])[:1000]]
+    paths = [p for p in paths if p.is_file()]
+    if not paths:
+        return web.json_response({"error": "those files are no longer in the folder"}, status=404)
+    loop = asyncio.get_running_loop()
+    try:
+        if data.get("action") == "copy":
+            await loop.run_in_executor(None, win32.set_clipboard_files, [str(p) for p in paths])
+        else:
+            win32.show_in_explorer(paths[-1])
+    except OSError as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response({"ok": True, "count": len(paths)})
+
+
+async def handle_clipboard(request: web.Request) -> web.Response:
+    """PC -> iPad: list the files currently copied on the PC (Ctrl+C in File Explorer)."""
+    hub = check_key(request)
+    if not IS_WINDOWS:
+        return web.json_response({"error": "only available on Windows"}, status=501)
+    try:
+        copied = await asyncio.get_running_loop().run_in_executor(None, win32.get_clipboard_files)
+    except OSError as exc:
+        return web.json_response({"error": str(exc)}, status=503)
+    files = [p for p in copied if os.path.isfile(p)]
+    hub.offered = {secrets.token_urlsafe(9): p for p in files}
+    return web.json_response({
+        "files": [{"id": fid, "name": os.path.basename(p), "size": os.path.getsize(p),
+                   "image": os.path.splitext(p)[1].lower() in IMAGE_TYPES} for fid, p in hub.offered.items()],
+        "folders": len(copied) - len(files),
+    })
+
+
+async def handle_clipboard_file(request: web.Request) -> web.StreamResponse:
+    hub = check_key(request)
+    path = hub.offered.get(request.match_info["fid"])
+    if not path or not os.path.isfile(path):
+        raise web.HTTPNotFound(text="copy the file on the PC again")
+    disposition = "attachment" if request.query.get("dl") else "inline"
+    headers = {"Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(os.path.basename(path))}",
+               "Cache-Control": "no-store"}
+    return web.FileResponse(path, headers=headers)
 
 
 def make_icon(size: int = 180) -> bytes:
@@ -529,6 +663,10 @@ def make_app(hub: Hub) -> web.Application:
     app.router.add_get("/icon.png", handle_icon)
     app.router.add_get("/manifest.json", handle_manifest)
     app.router.add_get(r"/{name:(app\.js|style\.css)}", handle_static)
+    app.router.add_post("/upload", handle_upload)
+    app.router.add_post("/saved", handle_saved)
+    app.router.add_get("/clipboard", handle_clipboard)
+    app.router.add_get("/clipboard/{fid}", handle_clipboard_file)
 
     async def on_startup(app):
         hub.loop = asyncio.get_running_loop()
@@ -707,6 +845,8 @@ def parse_args(argv=None):
     p.add_argument("--quality", type=int, default=90, help="JPEG quality for still content (default 90)")
     p.add_argument("--motion-quality", type=int, default=65, help="JPEG quality while things move (default 65)")
     p.add_argument("--view-only", action="store_true", help="ignore touch/pen/keyboard input from the iPad")
+    p.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR,
+                   help=r"where photos and files sent from the iPad are saved (default Downloads\iPad Display)")
     p.add_argument("--key", help="use this access key instead of the saved one")
     p.add_argument("--new-key", action="store_true", help="generate a new access key (old links stop working)")
     p.add_argument("--no-auth", action="store_true", help="no access key (anyone on the network can connect)")
@@ -761,6 +901,7 @@ def main(argv=None) -> None:
     print(f"\n  iPad Display {VERSION}")
     print(f"  Display : {target.label}")
     print(f"  Input   : {input_text}")
+    print(f"  Files   : photos and files sent from the iPad are saved in {args.save_dir}")
     if target.mirroring_primary:
         print("\n  Windows has no second display, so the iPad will MIRROR (duplicate) your main screen.")
         print("  To EXTEND onto the iPad instead:")

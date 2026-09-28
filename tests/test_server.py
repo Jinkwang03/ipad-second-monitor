@@ -1,6 +1,7 @@
 """End-to-end tests against a real server process streaming the test pattern."""
 import asyncio
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -45,9 +46,10 @@ class ServerTests(unittest.TestCase):
         cls.port = free_port()
         cls.base = f"http://127.0.0.1:{cls.port}"
         cls.log = tempfile.TemporaryFile()
+        cls.save_dir = Path(tempfile.mkdtemp(prefix="ipd-saved-"))
         cls.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "server.py"), "--monitor", "test", "--host", "127.0.0.1",
-             "--port", str(cls.port), "--key", KEY, "--fps", "30"],
+             "--port", str(cls.port), "--key", KEY, "--fps", "30", "--save-dir", str(cls.save_dir)],
             cwd=ROOT, stdout=cls.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -65,6 +67,7 @@ class ServerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.proc.terminate()
         cls.proc.wait(10)
+        shutil.rmtree(cls.save_dir, ignore_errors=True)
         cls.log.seek(0)
         output = cls.log.read().decode(errors="replace")
         cls.log.close()
@@ -74,6 +77,32 @@ class ServerTests(unittest.TestCase):
 
     def ws_url(self, key=KEY):
         return f"{self.base}/ws?key={key}"
+
+    def test_upload_saves_files_safely(self):
+        async def go():
+            async with aiohttp.ClientSession() as s:
+                url, name = f"{self.base}/upload", "../../evil name?.txt"
+                async with s.post(url, params={"key": KEY, "name": name, "mtime": "1700000000000"},
+                                  data=b"hello") as r:
+                    self.assertEqual(r.status, 200)
+                    first = (await r.json())["name"]
+                async with s.post(url, params={"key": KEY, "name": name}, data=b"again") as r:
+                    second = (await r.json())["name"]
+                async with s.post(url, params={"key": "nope", "name": "x.txt"}, data=b"x") as r:
+                    self.assertEqual(r.status, 403)
+                async with s.get(f"{self.base}/clipboard", params={"key": "nope"}) as r:
+                    self.assertEqual(r.status, 403)
+                async with s.post(f"{self.base}/saved", params={"key": "nope"}, json={"names": [first]}) as r:
+                    self.assertEqual(r.status, 403)
+            return first, second
+
+        first, second = asyncio.run(go())
+        self.assertEqual((first, second), ("evil name_.txt", "evil name_ (2).txt"))
+        saved = self.save_dir / first
+        self.assertEqual(saved.read_bytes(), b"hello")
+        self.assertEqual((self.save_dir / second).read_bytes(), b"again")
+        self.assertEqual(int(saved.stat().st_mtime), 1700000000)          # the photo keeps its date
+        self.assertEqual(sorted(p.name for p in self.save_dir.iterdir()), sorted([first, second]))
 
     def test_static_files(self):
         async def go():

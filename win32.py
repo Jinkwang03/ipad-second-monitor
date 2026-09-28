@@ -1,4 +1,4 @@
-"""Win32 plumbing via ctypes: DPI awareness, monitors, GDI capture, cursor and input.
+"""Win32 plumbing via ctypes: DPI awareness, monitors, GDI capture, cursor, input and clipboard.
 
 Importing this module switches the process to per-monitor DPI awareness so that
 every coordinate we see or produce is in physical pixels.
@@ -8,6 +8,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import struct
+import subprocess
 import time
 from dataclasses import dataclass
 
@@ -804,3 +806,99 @@ class InputInjector:
             if dev:
                 user32.DestroySyntheticPointerDevice(dev)
         self.touch_dev = self.pen_dev = None
+
+
+# ---------------------------------------------------------------------------
+# Clipboard file lists and File Explorer (moving files between the iPad and the PC)
+# ---------------------------------------------------------------------------
+
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+_proto(user32, "OpenClipboard", wt.BOOL, wt.HWND)
+_proto(user32, "CloseClipboard", wt.BOOL)
+_proto(user32, "EmptyClipboard", wt.BOOL)
+_proto(user32, "IsClipboardFormatAvailable", wt.BOOL, wt.UINT)
+_proto(user32, "GetClipboardData", wt.HANDLE, wt.UINT)
+_proto(user32, "SetClipboardData", wt.HANDLE, wt.UINT, wt.HANDLE)
+_proto(user32, "RegisterClipboardFormatW", wt.UINT, wt.LPCWSTR)
+_proto(user32, "CreateWindowExW", wt.HWND, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int,
+       ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID)
+_proto(user32, "DestroyWindow", wt.BOOL, wt.HWND)
+_proto(kernel32, "GlobalAlloc", wt.HGLOBAL, wt.UINT, ctypes.c_size_t)
+_proto(kernel32, "GlobalLock", ctypes.c_void_p, wt.HGLOBAL)
+_proto(kernel32, "GlobalUnlock", wt.BOOL, wt.HGLOBAL)
+_proto(kernel32, "GlobalFree", wt.HGLOBAL, wt.HGLOBAL)
+_proto(shell32, "DragQueryFileW", wt.UINT, wt.HANDLE, wt.UINT, wt.LPWSTR, wt.UINT)
+CF_HDROP = 15
+GMEM_MOVEABLE = 0x0002
+HWND_MESSAGE = wt.HWND(-3)
+DROPEFFECT_COPY = 1
+
+
+class _OpenClipboard:
+    """Open the clipboard for `owner`, retrying briefly while another app holds it."""
+
+    def __init__(self, owner=None):
+        self.owner = owner
+
+    def __enter__(self):
+        for _ in range(40):
+            if user32.OpenClipboard(self.owner):
+                return self
+            time.sleep(0.025)
+        raise OSError("the clipboard is busy; try again")
+
+    def __exit__(self, *exc):
+        user32.CloseClipboard()
+
+
+def get_clipboard_files() -> list[str]:
+    """Paths of the files currently copied (Ctrl+C in File Explorer), or []."""
+    with _OpenClipboard():
+        if not user32.IsClipboardFormatAvailable(CF_HDROP):
+            return []
+        hdrop = user32.GetClipboardData(CF_HDROP)
+        if not hdrop:
+            return []
+        paths = []
+        for i in range(shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)):
+            length = shell32.DragQueryFileW(hdrop, i, None, 0)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            shell32.DragQueryFileW(hdrop, i, buf, length + 1)
+            paths.append(buf.value)
+        return paths
+
+
+def _global_bytes(data: bytes):
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not handle:
+        raise MemoryError("GlobalAlloc failed")
+    ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+    kernel32.GlobalUnlock(handle)
+    return handle
+
+
+def set_clipboard_files(paths) -> None:
+    """Put files on the clipboard as if they were copied in File Explorer, so Ctrl+V pastes them."""
+    names = "".join(f"{p}\0" for p in paths) + "\0"
+    dropfiles = struct.pack("<IiiII", 20, 0, 0, 0, 1)    # DROPFILES: pFiles, pt.x, pt.y, fNC, fWide
+    # With no owner window, EmptyClipboard leaves the clipboard ownerless and SetClipboardData
+    # may fail, so own it with a hidden message-only window for the duration.
+    owner = user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
+    try:
+        with _OpenClipboard(owner):
+            user32.EmptyClipboard()
+            files = _global_bytes(dropfiles + names.encode("utf-16-le"))
+            if not user32.SetClipboardData(CF_HDROP, files):
+                kernel32.GlobalFree(files)
+                raise OSError(f"SetClipboardData failed ({ctypes.get_last_error()})")
+            effect = _global_bytes(struct.pack("<I", DROPEFFECT_COPY))
+            if not user32.SetClipboardData(user32.RegisterClipboardFormatW("Preferred DropEffect"), effect):
+                kernel32.GlobalFree(effect)
+    finally:
+        if owner:
+            user32.DestroyWindow(owner)
+
+
+def show_in_explorer(path) -> None:
+    """Open File Explorer with `path` selected."""
+    subprocess.Popen(f'explorer.exe /select,"{path}"')

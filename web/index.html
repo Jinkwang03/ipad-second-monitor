@@ -52,10 +52,42 @@
     <button id="btn-fullscreen" type="button">Full screen</button>
     <button id="btn-reconnect" type="button">Reconnect</button>
   </div>
+  <div class="section">
+    <div class="section-title">Photos &amp; files</div>
+    <div class="row buttons">
+      <button id="btn-send" type="button">Send to PC</button>
+      <button id="btn-receive" type="button">Get from PC</button>
+    </div>
+  </div>
 </div>
+<input id="file-input" type="file" multiple hidden>
 
 <div id="stats" hidden></div>
 <div id="fs-hint" hidden>Tap anywhere for full screen</div>
+
+<div id="transfer" class="card" role="status" hidden>
+  <div class="row head">
+    <strong id="transfer-title"></strong>
+    <button id="transfer-close" type="button" class="ghost" aria-label="Close">✕</button>
+  </div>
+  <p id="transfer-text"></p>
+  <div class="bar" id="transfer-bar-wrap"><div id="transfer-bar"></div></div>
+  <div class="row buttons" id="transfer-actions">
+    <button id="btn-show-pc" type="button">Show on PC</button>
+    <button id="btn-copy-pc" type="button">Copy on PC</button>
+  </div>
+</div>
+
+<div id="inbox" class="card" hidden>
+  <div class="row head">
+    <strong>Files copied on the PC</strong>
+    <button id="inbox-close" type="button" class="ghost" aria-label="Close">✕</button>
+  </div>
+  <p id="inbox-msg"></p>
+  <div id="inbox-list"></div>
+</div>
+
+<div id="drop" hidden>Drop to send to the PC</div>
 
 <div id="notice" class="card" role="status" hidden>
   <strong>Mirroring, not extending</strong>

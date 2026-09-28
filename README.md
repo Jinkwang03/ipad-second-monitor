@@ -137,6 +137,30 @@ Safari bars; only the thin status bar remains.
 The laptop's own mouse and keyboard work across both screens as usual. The iPad draws the
 real Windows cursor when it's on the iPad display.
 
+## Moving photos and files
+
+There's no need for email or cloud apps. Everything goes directly over your local network
+and uses the same access key as the screen. iPadOS doesn't let any app control other iPad
+apps, so this works through Safari's own file picker and downloads.
+
+**iPad → PC**
+- Open the menu and tap **Send to PC**, then pick from *Photo Library*, *Take Photo*, or
+  *Choose Files*. Or **drag photos** from the Photos or Files app (Split View / Stage
+  Manager) onto the screen.
+- Files are saved in `Downloads\iPad Display` on the PC (change it with `--save-dir`).
+  Each file gets the date the iPad reports for it, and photos keep the date they were taken
+  inside the file. A file with the same name gets `(2)` added instead of overwriting the old one.
+- When a transfer finishes:
+  - **Show on PC** opens File Explorer at the files.
+  - **Copy on PC** puts them on the Windows clipboard, so **Ctrl+V** pastes them into any
+    folder, chat or document.
+
+**PC → iPad**
+1. On the PC, select files in File Explorer and press **Ctrl+C**.
+2. On the iPad, open the menu and tap **Get from PC**.
+3. For photos, touch and hold one, then tap **Save to Photos**. For other files, tap
+   **Download**; they go to the Files app, in *Downloads*.
+
 ## Options
 
 ```
@@ -149,6 +173,7 @@ run.bat --fps 30               cap the frame rate (default 60)
 run.bat --quality 85           JPEG quality for still content (default 90)
 run.bat --motion-quality 55    JPEG quality while things move (default 65; lower = faster on weak Wi-Fi)
 run.bat --view-only            don't accept input from the iPad
+run.bat --save-dir D:\Photos   save photos and files from the iPad there (default Downloads\iPad Display)
 run.bat --new-key              make a new access key (old links stop working)
 run.bat --capture gdi          force the slower GDI capture if DXGI misbehaves
 run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi connection only)
