@@ -39,7 +39,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.2"
+VERSION = "1.2.1"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"

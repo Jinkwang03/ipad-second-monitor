@@ -606,29 +606,38 @@
   $('transfer-close').addEventListener('click', () => { transfer.hidden = true; });
 
   // Drag photos in from the Photos or Files app (Split View / Stage Manager).
-  let dragDepth = 0;
-  const carriesFiles = (e) => !!e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files');
-  document.addEventListener('dragenter', (e) => {
-    if (!carriesFiles(e)) return;
-    e.preventDefault();
-    dragDepth++;
+  // Safari on iPad doesn't say what is being dragged until the drop, so accept every drag
+  // that comes in and look at its contents only when it lands.
+  let dropHideTimer = 0;
+  function showDropZone(e) {
+    e.preventDefault();                      // without this the page refuses the drop
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
     dropEl.hidden = false;
-  });
-  document.addEventListener('dragover', (e) => {
-    if (!carriesFiles(e)) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
-  });
-  document.addEventListener('dragleave', (e) => {
-    if (!carriesFiles(e)) return;
-    if (--dragDepth <= 0) { dragDepth = 0; dropEl.hidden = true; }
-  });
+    clearTimeout(dropHideTimer);             // dragover repeats while hovering; if it stops,
+    dropHideTimer = setTimeout(() => { dropEl.hidden = true; }, 600);  // the drag has left
+  }
+  document.addEventListener('dragenter', showDropZone);
+  document.addEventListener('dragover', showDropZone);
+  document.addEventListener('dragend', () => { dropEl.hidden = true; });
+
+  function droppedFiles(dt) {
+    const files = [...(dt.files || [])];
+    if (!files.length && dt.items) {         // some drags only expose files as items
+      for (const item of dt.items) {
+        const file = item.kind === 'file' ? item.getAsFile() : null;
+        if (file) files.push(file);
+      }
+    }
+    return files;
+  }
+
   document.addEventListener('drop', (e) => {
-    if (!carriesFiles(e)) return;
     e.preventDefault();
-    dragDepth = 0;
+    clearTimeout(dropHideTimer);
     dropEl.hidden = true;
-    sendFiles([...e.dataTransfer.files]);
+    const files = e.dataTransfer ? droppedFiles(e.dataTransfer) : [];
+    if (files.length) sendFiles(files);
+    else showTransfer('Nothing to send', 'Only photos and files can be sent to the PC. Try dragging them from the Photos or Files app.');
   });
 
   function showInbox(message, files = []) {
