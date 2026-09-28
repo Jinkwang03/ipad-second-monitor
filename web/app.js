@@ -166,6 +166,9 @@
       case 'pong':
         stats.rtt = performance.now() - m.ts;
         break;
+      case 'offer':                          // files dropped on the PC's "Drop files here" box
+        if (m.files && m.files.length) showInbox(null, m.files, 'Sent from the PC');
+        break;
     }
   }
 
@@ -640,7 +643,8 @@
     else showTransfer('Nothing to send', 'Only photos and files can be sent to the PC. Try dragging them from the Photos or Files app.');
   });
 
-  function showInbox(message, files = []) {
+  function showInbox(message, files = [], title = 'Files copied on the PC') {
+    $('inbox-title').textContent = title;
     const list = $('inbox-list');
     list.textContent = '';
     const photos = files.some((f) => f.image);

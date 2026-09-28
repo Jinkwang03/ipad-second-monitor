@@ -10,6 +10,7 @@ import ctypes.wintypes as wt
 import logging
 import struct
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 
@@ -902,3 +903,248 @@ def set_clipboard_files(paths) -> None:
 def show_in_explorer(path) -> None:
     """Open File Explorer with `path` selected."""
     subprocess.Popen(f'explorer.exe /select,"{path}"')
+
+
+# ---------------------------------------------------------------------------
+# "Drop files here to send them to the iPad" box
+# ---------------------------------------------------------------------------
+
+LRESULT = ctypes.c_ssize_t
+WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR), ("hIconSm", wt.HICON)]
+
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [("hdc", wt.HDC), ("fErase", wt.BOOL), ("rcPaint", wt.RECT), ("fRestore", wt.BOOL),
+                ("fIncUpdate", wt.BOOL), ("rgbReserved", ctypes.c_byte * 32)]
+
+
+_proto(user32, "RegisterClassExW", wt.ATOM, ctypes.POINTER(WNDCLASSEXW))
+_proto(user32, "DefWindowProcW", LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+_proto(user32, "GetMessageW", wt.BOOL, ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT)
+_proto(user32, "TranslateMessage", wt.BOOL, ctypes.POINTER(wt.MSG))
+_proto(user32, "DispatchMessageW", LRESULT, ctypes.POINTER(wt.MSG))
+_proto(user32, "PostMessageW", wt.BOOL, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+_proto(user32, "PostQuitMessage", None, ctypes.c_int)
+_proto(user32, "SetWindowPos", wt.BOOL, wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+       ctypes.c_int, wt.UINT)
+_proto(user32, "ShowWindow", wt.BOOL, wt.HWND, ctypes.c_int)
+_proto(user32, "IsWindowVisible", wt.BOOL, wt.HWND)
+_proto(user32, "SetLayeredWindowAttributes", wt.BOOL, wt.HWND, wt.COLORREF, wt.BYTE, wt.DWORD)
+_proto(user32, "SetWindowRgn", ctypes.c_int, wt.HWND, wt.HRGN, wt.BOOL)
+_proto(user32, "BeginPaint", wt.HDC, wt.HWND, ctypes.POINTER(PAINTSTRUCT))
+_proto(user32, "EndPaint", wt.BOOL, wt.HWND, ctypes.POINTER(PAINTSTRUCT))
+_proto(user32, "InvalidateRect", wt.BOOL, wt.HWND, ctypes.c_void_p, wt.BOOL)
+_proto(user32, "SetTimer", ctypes.c_size_t, wt.HWND, ctypes.c_size_t, wt.UINT, ctypes.c_void_p)
+_proto(user32, "KillTimer", wt.BOOL, wt.HWND, ctypes.c_size_t)
+_proto(user32, "GetClientRect", wt.BOOL, wt.HWND, ctypes.POINTER(wt.RECT))
+_proto(user32, "FillRect", ctypes.c_int, wt.HDC, ctypes.POINTER(wt.RECT), wt.HBRUSH)
+_proto(user32, "DrawTextW", ctypes.c_int, wt.HDC, wt.LPCWSTR, ctypes.c_int, ctypes.POINTER(wt.RECT), wt.UINT)
+_proto(user32, "LoadCursorW", wt.HANDLE, wt.HINSTANCE, ctypes.c_void_p)
+_proto(user32, "MonitorFromPoint", wt.HMONITOR, wt.POINT, wt.DWORD)
+_proto(user32, "ChangeWindowMessageFilterEx", wt.BOOL, wt.HWND, wt.UINT, wt.DWORD, ctypes.c_void_p)
+_proto(gdi32, "CreateSolidBrush", wt.HBRUSH, wt.COLORREF)
+_proto(gdi32, "CreatePen", wt.HPEN, ctypes.c_int, ctypes.c_int, wt.COLORREF)
+_proto(gdi32, "CreateRoundRectRgn", wt.HRGN, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+       ctypes.c_int, ctypes.c_int)
+_proto(gdi32, "RoundRect", wt.BOOL, wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+       ctypes.c_int, ctypes.c_int)
+_proto(gdi32, "CreateFontW", wt.HFONT, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+       wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, wt.LPCWSTR)
+_proto(gdi32, "SetBkMode", ctypes.c_int, wt.HDC, ctypes.c_int)
+_proto(gdi32, "SetTextColor", wt.COLORREF, wt.HDC, wt.COLORREF)
+_proto(gdi32, "GetStockObject", wt.HGDIOBJ, ctypes.c_int)
+_proto(shell32, "DragFinish", None, wt.HANDLE)
+_proto(kernel32, "GetModuleHandleW", wt.HMODULE, wt.LPCWSTR)
+
+WS_POPUP = 0x80000000
+WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_ACCEPTFILES = 0x8, 0x80, 0x10
+WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x80000, 0x08000000
+WM_DESTROY, WM_CLOSE, WM_PAINT, WM_TIMER = 0x0002, 0x0010, 0x000F, 0x0113
+WM_NCHITTEST, WM_MOUSEACTIVATE, WM_DROPFILES = 0x0084, 0x0021, 0x0233
+WM_COPYDATA, WM_COPYGLOBALDATA = 0x004A, 0x0049
+HTCAPTION, MA_NOACTIVATE, MSGFLT_ALLOW, LWA_ALPHA = 2, 3, 1, 0x2
+SWP_NOACTIVATE, SWP_SHOWWINDOW, HWND_TOPMOST = 0x0010, 0x0040, wt.HWND(-1)
+SW_HIDE, SW_SHOWNOACTIVATE = 0, 4
+DT_CENTER, DT_VCENTER, DT_SINGLELINE, DT_END_ELLIPSIS = 0x1, 0x4, 0x20, 0x8000
+MONITOR_DEFAULTTONEAREST = 2
+
+
+def _rgb(r: int, g: int, b: int) -> int:
+    return r | (g << 8) | (b << 16)
+
+
+def work_area_at(x: int, y: int):
+    """(left, top, right, bottom, dpi) of the work area (screen minus taskbar) of the monitor at x, y."""
+    hmon = user32.MonitorFromPoint(wt.POINT(x, y), MONITOR_DEFAULTTONEAREST)
+    mi = MONITORINFOEXW(cbSize=ctypes.sizeof(MONITORINFOEXW))
+    user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+    r = mi.rcWork
+    return r.left, r.top, r.right, r.bottom, _monitor_dpi(hmon)
+
+
+class DropBox:
+    """A small always-on-top box on the iPad's screen; files dropped on it are sent to the iPad.
+
+    `get_rect()` returns the (left, top, width, height) of the display to sit on, or None to
+    hide the box (e.g. while no iPad is connected). `on_drop(paths)` handles a drop and returns
+    a short message to show in the box for a moment. Runs its own window thread.
+    """
+
+    WIDTH, HEIGHT, MARGIN, RADIUS = 210, 64, 16, 16   # logical pixels
+    TIMER_PLACE, TIMER_STATUS = 1, 2
+    CLASS_NAME = "iPadDisplayDropBox"
+
+    def __init__(self, get_rect, on_drop):
+        self.get_rect = get_rect
+        self.on_drop = on_drop
+        self.hwnd = None
+        self.status = ""
+        self.placed_for = None
+        self.scale = 1.0
+        self.fonts = (None, None)
+        self._wndproc = WNDPROC(self._proc)   # keep the callback alive for the window's lifetime
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="dropbox", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+        self.ready.wait(5)
+
+    def stop(self) -> None:
+        if self.hwnd:
+            user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+
+    # ---- window thread ------------------------------------------------------
+
+    def _run(self) -> None:
+        hinst = kernel32.GetModuleHandleW(None)
+        wc = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW), lpfnWndProc=self._wndproc, hInstance=hinst,
+                         hCursor=user32.LoadCursorW(None, ctypes.c_void_p(32512)),   # IDC_ARROW
+                         lpszClassName=self.CLASS_NAME)
+        user32.RegisterClassExW(ctypes.byref(wc))
+        style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_ACCEPTFILES | WS_EX_NOACTIVATE
+        self.hwnd = user32.CreateWindowExW(style, self.CLASS_NAME, "Send to iPad", WS_POPUP,
+                                           0, 0, 10, 10, None, None, hinst, None)
+        if not self.hwnd:
+            log.warning("Could not create the drop box (%d)", ctypes.get_last_error())
+            self.ready.set()
+            return
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 250, LWA_ALPHA)
+        for msg in (WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA):   # still accept drops if we run elevated
+            user32.ChangeWindowMessageFilterEx(self.hwnd, msg, MSGFLT_ALLOW, None)
+        self._place()
+        user32.SetTimer(self.hwnd, self.TIMER_PLACE, 1000, None)
+        self.ready.set()
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _place(self) -> None:
+        rect = self.get_rect()
+        if rect is None:
+            if user32.IsWindowVisible(self.hwnd):
+                user32.ShowWindow(self.hwnd, SW_HIDE)
+            self.placed_for = None
+            return
+        left, top, width, height = rect
+        area = work_area_at(left + width // 2, top + height // 2)
+        if area == self.placed_for:
+            if not user32.IsWindowVisible(self.hwnd):
+                user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+            return
+        self.placed_for = area                 # a new display: go to its bottom-right corner
+        wl, wtop, wr, wb, dpi = area
+        k = self.scale = dpi / 96
+        w, h, m = round(self.WIDTH * k), round(self.HEIGHT * k), round(self.MARGIN * k)
+        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, wr - w - m, wb - h - m, w, h,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        radius = round(self.RADIUS * k)
+        user32.SetWindowRgn(self.hwnd, gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius), True)
+        for font in self.fonts:
+            if font:
+                gdi32.DeleteObject(font)
+        self.fonts = tuple(gdi32.CreateFontW(-round(size * k), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
+                           for size, weight in ((15, 600), (12, 400)))
+        user32.InvalidateRect(self.hwnd, None, True)
+
+    def _flash(self, text: str) -> None:
+        self.status = text
+        user32.InvalidateRect(self.hwnd, None, True)
+        user32.SetTimer(self.hwnd, self.TIMER_STATUS, 3000, None)
+
+    def _paint(self, hwnd) -> None:
+        ps = PAINTSTRUCT()
+        hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+        try:
+            rc = wt.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rc))
+            k = self.scale
+            brush = gdi32.CreateSolidBrush(_rgb(24, 24, 27))
+            user32.FillRect(hdc, ctypes.byref(rc), brush)
+            gdi32.DeleteObject(brush)
+            pen = gdi32.CreatePen(0, max(2, round(2 * k)), _rgb(56, 189, 248))
+            old_pen = gdi32.SelectObject(hdc, pen)
+            old_brush = gdi32.SelectObject(hdc, gdi32.GetStockObject(5))   # NULL_BRUSH
+            radius = round(self.RADIUS * k)
+            gdi32.RoundRect(hdc, 1, 1, rc.right - 1, rc.bottom - 1, radius, radius)
+            gdi32.SelectObject(hdc, old_pen)
+            gdi32.SelectObject(hdc, old_brush)
+            gdi32.DeleteObject(pen)
+            gdi32.SetBkMode(hdc, 1)                                        # TRANSPARENT
+            flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS
+            title_font, sub_font = self.fonts
+            old_font = gdi32.SelectObject(hdc, title_font)
+            gdi32.SetTextColor(hdc, _rgb(255, 255, 255))
+            if self.status:
+                user32.DrawTextW(hdc, self.status, -1, ctypes.byref(rc), flags)
+            else:
+                mid = rc.bottom // 2
+                user32.DrawTextW(hdc, "Drop files here", -1, ctypes.byref(wt.RECT(0, round(4 * k), rc.right, mid + round(4 * k))), flags)
+                gdi32.SelectObject(hdc, sub_font)
+                gdi32.SetTextColor(hdc, _rgb(161, 161, 170))
+                user32.DrawTextW(hdc, "to send them to the iPad", -1, ctypes.byref(wt.RECT(0, mid, rc.right, rc.bottom - round(6 * k))), flags)
+            gdi32.SelectObject(hdc, old_font)
+        finally:
+            user32.EndPaint(hwnd, ctypes.byref(ps))
+
+    def _proc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == WM_NCHITTEST:
+                return HTCAPTION                    # drag the box anywhere to move it
+            if msg == WM_MOUSEACTIVATE:
+                return MA_NOACTIVATE                # never take focus from what you're working in
+            if msg == WM_DROPFILES:
+                paths = []
+                for i in range(shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)):
+                    length = shell32.DragQueryFileW(wparam, i, None, 0)
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    shell32.DragQueryFileW(wparam, i, buf, length + 1)
+                    paths.append(buf.value)
+                shell32.DragFinish(wparam)
+                self._flash(self.on_drop(paths))
+                return 0
+            if msg == WM_PAINT:
+                self._paint(hwnd)
+                return 0
+            if msg == WM_TIMER:
+                if wparam == self.TIMER_PLACE:
+                    self._place()
+                elif wparam == self.TIMER_STATUS:
+                    user32.KillTimer(hwnd, self.TIMER_STATUS)
+                    self.status = ""
+                    user32.InvalidateRect(hwnd, None, True)
+                return 0
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            log.exception("drop box")
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)

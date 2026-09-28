@@ -39,7 +39,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.2.1"
+VERSION = "1.3"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -93,9 +93,42 @@ class Hub:
         self.mirror_hint = ""                         # why we mirror instead of extending, if we do
         self.mdns: mdns.MdnsResponder | None = None   # answers <name>.local on the local network
         self.offered: dict[str, str] = {}             # id -> path of files copied on the PC, for the iPad
+        self.drop_box = None                          # "drop files here" box on the iPad's screen
 
     def key_ok(self, value: str) -> bool:
         return not self.key or secrets.compare_digest(value.encode(), self.key.encode())
+
+    # ---- PC -> iPad files (event loop, except drop_files) -----------------
+
+    def make_offer(self, paths) -> dict:
+        """Make these files downloadable by the iPad (under random ids) and describe them."""
+        files = [p for p in paths if os.path.isfile(p)]
+        self.offered = {secrets.token_urlsafe(9): p for p in files}
+        return {"files": [{"id": fid, "name": os.path.basename(p), "size": os.path.getsize(p),
+                           "image": os.path.splitext(p)[1].lower() in IMAGE_TYPES}
+                          for fid, p in self.offered.items()],
+                "folders": len(paths) - len(files)}
+
+    def offer_files(self, paths) -> None:
+        msg = {"t": "offer", **self.make_offer(paths)}
+        for s in list(self.sessions):
+            asyncio.ensure_future(s.send_json(msg))
+        log.info("Sent %d file(s) from the PC to the iPad", len(msg["files"]))
+
+    def drop_files(self, paths) -> str:
+        """Files dropped on the drop box (window thread); returns what the box should say."""
+        files = [p for p in paths if os.path.isfile(p)]
+        if not files:
+            return "Folders can't be sent - drop files"
+        if not self.sessions:
+            return "Connect the iPad first"
+        self._call(self.offer_files, files)
+        return f"Sent {len(files)} file{'s' if len(files) != 1 else ''} to the iPad"
+
+    def drop_box_rect(self):
+        """Where the drop box sits: on the streamed display, and only while an iPad is connected."""
+        target = self.target
+        return target.rect if target is not None and self.sessions else None
 
     # ---- sessions -------------------------------------------------------
 
@@ -620,13 +653,7 @@ async def handle_clipboard(request: web.Request) -> web.Response:
         copied = await asyncio.get_running_loop().run_in_executor(None, win32.get_clipboard_files)
     except OSError as exc:
         return web.json_response({"error": str(exc)}, status=503)
-    files = [p for p in copied if os.path.isfile(p)]
-    hub.offered = {secrets.token_urlsafe(9): p for p in files}
-    return web.json_response({
-        "files": [{"id": fid, "name": os.path.basename(p), "size": os.path.getsize(p),
-                   "image": os.path.splitext(p)[1].lower() in IMAGE_TYPES} for fid, p in hub.offered.items()],
-        "folders": len(copied) - len(files),
-    })
+    return web.json_response(hub.make_offer(copied))
 
 
 async def handle_clipboard_file(request: web.Request) -> web.StreamResponse:
@@ -676,6 +703,9 @@ def make_app(hub: Hub) -> web.Application:
             app["tasks"].append(asyncio.ensure_future(hub.fake_cursor()))
         elif IS_WINDOWS:
             threading.Thread(target=hub.cursor_loop, name="cursor", daemon=True).start()
+            if not hub.args.no_drop_box:
+                hub.drop_box = win32.DropBox(hub.drop_box_rect, hub.drop_files)
+                hub.drop_box.start()
         if hub.injector:
             app["tasks"].append(asyncio.ensure_future(input_keepalive(hub.injector)))
         if hub.args.host in ALL_INTERFACES:
@@ -685,6 +715,8 @@ def make_app(hub: Hub) -> web.Application:
         hub.stopping.set()
         if hub.mdns:
             hub.mdns.stop()
+        if hub.drop_box:
+            hub.drop_box.stop()
         hub.wake_capture.set()
         for task in app["tasks"]:
             task.cancel()
@@ -845,6 +877,8 @@ def parse_args(argv=None):
     p.add_argument("--quality", type=int, default=90, help="JPEG quality for still content (default 90)")
     p.add_argument("--motion-quality", type=int, default=65, help="JPEG quality while things move (default 65)")
     p.add_argument("--view-only", action="store_true", help="ignore touch/pen/keyboard input from the iPad")
+    p.add_argument("--no-drop-box", action="store_true",
+                   help="don't show the 'Drop files here' box for sending files to the iPad")
     p.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR,
                    help=r"where photos and files sent from the iPad are saved (default Downloads\iPad Display)")
     p.add_argument("--key", help="use this access key instead of the saved one")

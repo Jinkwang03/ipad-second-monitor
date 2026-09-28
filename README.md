@@ -156,10 +156,16 @@ apps, so this works through Safari's own file picker and downloads.
     folder, chat or document.
 
 **PC → iPad**
-1. On the PC, select files in File Explorer and press **Ctrl+C**.
-2. On the iPad, open the menu and tap **Get from PC**.
-3. For photos, touch and hold one, then tap **Save to Photos**. For other files, tap
-   **Download**; they go to the Files app, in *Downloads*.
+- **Drag and drop:** while an iPad is connected, a small **"Drop files here"** box sits in
+  the bottom-right corner of the iPad's screen. Drag files onto it with the laptop's mouse,
+  from File Explorer or the desktop. The iPad immediately shows them under **Sent from the
+  PC**. You can drag the box somewhere else, and it never takes keyboard focus. Turn it off
+  with `--no-drop-box`.
+- **Copy and paste:** select files in File Explorer and press **Ctrl+C**, then on the iPad
+  open the menu and tap **Get from PC**.
+- Either way, to save them on the iPad: for photos, touch and hold one, then tap **Save to
+  Photos**. For other files, tap **Download**; they go to the Files app, in *Downloads*.
+  iPadOS needs that one tap, because a web page can't save into Photos or Files by itself.
 
 ## Options
 
@@ -174,6 +180,7 @@ run.bat --quality 85           JPEG quality for still content (default 90)
 run.bat --motion-quality 55    JPEG quality while things move (default 65; lower = faster on weak Wi-Fi)
 run.bat --view-only            don't accept input from the iPad
 run.bat --save-dir D:\Photos   save photos and files from the iPad there (default Downloads\iPad Display)
+run.bat --no-drop-box          don't show the "Drop files here" box for sending files to the iPad
 run.bat --new-key              make a new access key (old links stop working)
 run.bat --capture gdi          force the slower GDI capture if DXGI misbehaves
 run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi connection only)
