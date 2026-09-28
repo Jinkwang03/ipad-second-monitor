@@ -1,0 +1,6 @@
+aiohttp>=3.9
+numpy>=1.24
+pillow>=10
+simplejpeg>=1.7
+qrcode>=7
+dxcam>=0.3,<0.4; sys_platform == "win32"

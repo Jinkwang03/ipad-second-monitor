@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Display">
+<meta name="theme-color" content="#000000">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="style.css">
+<title>iPad Display</title>
+</head>
+<body>
+<div id="stage">
+  <canvas id="screen" width="16" height="10"></canvas>
+  <div id="cursor"></div>
+</div>
+
+<div id="status" class="card">
+  <div class="spinner" aria-hidden="true"></div>
+  <p id="status-text">Connecting…</p>
+</div>
+
+<form id="keyform" class="card" hidden>
+  <h1>iPad Display</h1>
+  <p id="keyform-msg">Enter the access key shown on your PC.</p>
+  <input id="key-input" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="access key">
+  <button type="submit">Connect</button>
+</form>
+
+<button id="handle" type="button" aria-label="Menu"></button>
+
+<div id="panel" class="card" hidden>
+  <div class="row head">
+    <strong>iPad Display</strong>
+    <button id="panel-close" type="button" class="ghost" aria-label="Close">✕</button>
+  </div>
+  <dl>
+    <dt>PC display</dt><dd id="info-display">–</dd>
+    <dt>This iPad</dt><dd id="info-ipad">–</dd>
+    <dt>Stream</dt><dd id="info-stats">–</dd>
+  </dl>
+  <p id="info-tip" class="tip" hidden></p>
+  <label class="toggle"><input type="checkbox" id="opt-mouse"> Touch acts as a mouse</label>
+  <label class="toggle"><input type="checkbox" id="opt-cmd"> ⌘ key acts as Ctrl</label>
+  <label class="toggle"><input type="checkbox" id="opt-fs"> Full screen on first tap</label>
+  <label class="toggle"><input type="checkbox" id="opt-stats"> Show stats on screen</label>
+  <div class="row buttons">
+    <button id="btn-fullscreen" type="button">Full screen</button>
+    <button id="btn-reconnect" type="button">Reconnect</button>
+  </div>
+</div>
+
+<div id="stats" hidden></div>
+<div id="fs-hint" hidden>Tap anywhere for full screen</div>
+
+<div id="notice" class="card" role="status" hidden>
+  <strong>Mirroring, not extending</strong>
+  <p id="notice-text"></p>
+  <button id="notice-close" type="button">OK</button>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
