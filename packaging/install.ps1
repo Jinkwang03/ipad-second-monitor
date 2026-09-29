@@ -39,6 +39,8 @@ function New-Shortcut([string]$Path, [string]$TargetPath, [string]$Arguments = '
 $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'iPad Display'
 New-Item -ItemType Directory $menu -Force | Out-Null
 New-Shortcut "$menu\iPad Display.lnk" $exe
+New-Shortcut "$menu\iPad Display (own Wi-Fi).lnk" $exe '--hotspot' `
+    'Use your iPad as a second monitor over the laptop''s own Wi-Fi (works offline)'
 New-Shortcut "$menu\Uninstall iPad Display.lnk" 'powershell.exe' `
     "-NoProfile -ExecutionPolicy Bypass -File `"$target\uninstall.ps1`"" 'Remove iPad Display'
 New-Shortcut (Join-Path ([Environment]::GetFolderPath('Desktop')) 'iPad Display.lnk') $exe

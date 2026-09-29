@@ -137,6 +137,24 @@ Safari bars; only the thin status bar remains.
 The laptop's own mouse and keyboard work across both screens as usual. The iPad draws the
 real Windows cursor when it's on the iPad display.
 
+## No Wi-Fi around (offline)
+
+iPad Display never needs the internet. It only needs the laptop and the iPad on the same
+network, and the laptop can make that network itself:
+
+- **Automatically:** if the laptop isn't on any network when iPad Display starts (or loses
+  its network while running), it turns on Windows' **Mobile hotspot** by itself, even with
+  no internet at all.
+- **On purpose:** start **iPad Display (own Wi-Fi)** from the Start menu (or run it with
+  `--hotspot`) to always use the laptop's own Wi-Fi, for example on public Wi-Fi that blocks
+  devices from reaching each other.
+
+The window then shows the **Wi-Fi name and password** and a QR code. Point the iPad's
+Camera at it to join that Wi-Fi, then open your usual `ipad-display.local` link or Home
+Screen icon. Without internet the iPad says *No Internet Connection*; that's expected, and
+iPad Display works normally. When you close iPad Display, it turns the hotspot off again
+if it was the one that turned it on. Use `--no-hotspot` to never turn it on automatically.
+
 ## Moving photos and files
 
 There's no need for email or cloud apps. Everything goes directly over your local network

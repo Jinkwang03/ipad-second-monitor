@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from aiohttp import WSMsgType, web
 from PIL import Image, ImageDraw
 
 import capture
+import hotspot
 import mdns
 import tiles
 
@@ -39,7 +41,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.3"
+VERSION = "1.4"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -94,6 +96,8 @@ class Hub:
         self.mdns: mdns.MdnsResponder | None = None   # answers <name>.local on the local network
         self.offered: dict[str, str] = {}             # id -> path of files copied on the PC, for the iPad
         self.drop_box = None                          # "drop files here" box on the iPad's screen
+        self.hotspot_started = False                  # we turned on the laptop's Wi-Fi hotspot (turn it off at exit)
+        self.hotspot_tried = False
 
     def key_ok(self, value: str) -> bool:
         return not self.key or secrets.compare_digest(value.encode(), self.key.encode())
@@ -749,6 +753,9 @@ async def watch_network(hub: Hub) -> None:
         last = current
         if not nets:
             log.info("Network changed: this PC is not on any network right now.")
+            if hotspot_allowed(hub.args) and not hub.hotspot_tried:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, start_hotspot, hub, "No network, so the iPad can't reach this PC.")
             continue
         log.info("Network changed. The iPad can now connect at:")
         print_addresses(hub.args, hub.key, named=hub.mdns is not None, nets=nets, qr=hub.mdns is None)
@@ -788,12 +795,42 @@ def load_key(args) -> str:
 
 
 def network_addresses() -> list[tuple[str, str]]:
-    """(label, IPv4) of the networks an iPad could reach this PC on, main network first."""
-    found = win32.network_addresses() if IS_WINDOWS else []
-    if not found:
+    """(label, IPv4) of the networks an iPad could reach this PC on, main network first.
+
+    On Windows this leaves out adapters an iPad can never reach (WSL, Hyper-V, VMs), so an
+    empty list really means "no network" and the laptop's own hotspot is needed.
+    """
+    if IS_WINDOWS:
+        found = win32.network_addresses()
+    else:
         found = [("Network", ip) for ip in sorted(mdns.local_ipv4())]
     default = mdns.route_ip("10.254.254.254")
     return sorted(found, key=lambda net: net[1] != default)
+
+
+def hotspot_allowed(args) -> bool:
+    return IS_WINDOWS and args.host in ALL_INTERFACES and args.monitor != "test" and not args.no_hotspot
+
+
+def start_hotspot(hub: Hub, why: str) -> None:
+    """Turn on the laptop's own Wi-Fi (Windows Mobile hotspot) and show how to join it."""
+    hub.hotspot_tried = True
+    print("\n  " + " ".join(filter(None, [why, "Turning on this laptop's own Wi-Fi (Mobile hotspot)..."])),
+          flush=True)
+    was_on = hotspot.status().get("state") == "On"
+    info = hotspot.start()
+    if not info.get("ok"):
+        print(f"  Could not turn on the hotspot: {info.get('error')}", flush=True)
+        return
+    hub.hotspot_started = not was_on
+    print("\n  The laptop's Wi-Fi is ON. On the iPad, join this Wi-Fi (or scan the code with the Camera):\n")
+    print(f"      Wi-Fi name : {info['ssid']}")
+    print(f"      Password   : {info['passphrase']}\n")
+    print_qr(hotspot.wifi_qr_text(info["ssid"], info["passphrase"]))
+    if info.get("offline"):
+        print("\n  There's no internet, so the iPad will say \"No Internet Connection\" - that's fine.")
+    time.sleep(2)   # give the hotspot's own address a moment to appear
+    sys.stdout.flush()
 
 
 def page_url(host: str, args, key: str) -> str:
@@ -877,6 +914,10 @@ def parse_args(argv=None):
     p.add_argument("--quality", type=int, default=90, help="JPEG quality for still content (default 90)")
     p.add_argument("--motion-quality", type=int, default=65, help="JPEG quality while things move (default 65)")
     p.add_argument("--view-only", action="store_true", help="ignore touch/pen/keyboard input from the iPad")
+    p.add_argument("--hotspot", action="store_true",
+                   help="turn on this laptop's own Wi-Fi (Mobile hotspot) for the iPad - works without internet")
+    p.add_argument("--no-hotspot", action="store_true",
+                   help="never turn the hotspot on by itself when the laptop has no network")
     p.add_argument("--no-drop-box", action="store_true",
                    help="don't show the 'Drop files here' box for sending files to the iPad")
     p.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR,
@@ -941,6 +982,11 @@ def main(argv=None) -> None:
         print("  To EXTEND onto the iPad instead:")
         print("  " + capture.mirror_hint().replace("\n", "\n  "))
         print("  The new display is picked up automatically while this program runs.")
+    if hotspot_allowed(args) and (args.hotspot or not network_addresses()):
+        start_hotspot(hub, "" if args.hotspot else "This laptop isn't on any network.")
+    if IS_WINDOWS:   # closing the window with X skips normal shutdown; still switch our hotspot off
+        win32.on_console_close(lambda: hub.hotspot_started and hotspot.stop())
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)   # Ctrl+Break stops cleanly, like Ctrl+C
     print_addresses(args, key, named=hub.mdns is not None)
     print("\n  Tip: Share > Add to Home Screen gives you a full-screen app.   Ctrl+C stops.\n")
 
@@ -948,6 +994,10 @@ def main(argv=None) -> None:
         web.run_app(app, host=args.host, port=args.port, print=None, access_log=None)
     except OSError as exc:
         sys.exit(f"Could not listen on port {args.port}: {exc}. Is it already running? Try --port 8766.")
+    finally:
+        if hub.hotspot_started:
+            print("Turning off the laptop's Wi-Fi hotspot...")
+            hotspot.stop()
 
 
 if __name__ == "__main__":

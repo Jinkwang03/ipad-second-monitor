@@ -1148,3 +1148,27 @@ class DropBox:
         except Exception:
             log.exception("drop box")
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+# ---------------------------------------------------------------------------
+# Console window closing
+# ---------------------------------------------------------------------------
+
+HANDLER_ROUTINE = ctypes.WINFUNCTYPE(wt.BOOL, wt.DWORD)
+_close_handlers = []   # keep the callbacks alive
+CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT = 2, 5, 6
+
+
+def on_console_close(fn) -> None:
+    """Run fn() when the console window is closed (X), or at log-off / shutdown."""
+    def handler(event):
+        if event in (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT):
+            try:
+                fn()
+            except Exception:
+                pass
+        return False   # then let Windows close the program as usual
+    callback = HANDLER_ROUTINE(handler)
+    _close_handlers.append(callback)
+    kernel32.SetConsoleCtrlHandler(callback, True)
+
