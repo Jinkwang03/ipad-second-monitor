@@ -108,31 +108,53 @@ def make_hub(w=640, h=400):
 
 
 class MotionModeTests(unittest.TestCase):
-    """Moving content goes as sharp as the connection delivers in time, without flip-flopping."""
+    """Moving content is sent at full size only while that keeps delay and ping low."""
     PX = 2266 * 1488                               # the whole screen scrolling
 
-    def desired(self, rate):
-        return server.desired_motion_mode(self.PX, rate, 0.2)
+    def desired(self, rate, delay=None, rtt=0.0, base_rtt=None):
+        return server.desired_motion_mode(self.PX, rate, 0.2, delay, rtt, base_rtt)
 
-    def test_mode_follows_connection_speed(self):
-        self.assertEqual(self.desired(None), "normal")     # nothing measured yet
-        self.assertEqual(self.desired(100e6), "sharp")     # 100 MB/s: room for extra quality
-        self.assertEqual(self.desired(15e6), "normal")     # 674 KB in ~45 ms
-        self.assertEqual(self.desired(5e6), "light")       # too slow for full size
+    def test_mode_follows_the_connection(self):
+        self.assertEqual(self.desired(None), "normal")             # nothing measured yet
+        self.assertEqual(self.desired(30e6), "normal")             # 674 KB in ~22 ms
+        self.assertEqual(self.desired(5e6), "light")               # too slow for full size
 
-    def test_auto_goes_lighter_quickly_but_recovers_slowly(self):
+    def test_late_updates_or_a_rising_ping_mean_light(self):
+        self.assertEqual(self.desired(30e6, delay=0.090), "light")               # arriving late
+        self.assertEqual(self.desired(30e6, rtt=0.060, base_rtt=0.004), "light")  # Wi-Fi queueing
+        self.assertEqual(self.desired(30e6, delay=0.040, rtt=0.006, base_rtt=0.004), "normal")
+
+    def test_goes_light_quickly_but_back_slowly(self):
         auto = server.MotionMode()
         self.assertEqual(auto.update("light", 0.0), "normal")
-        self.assertEqual(auto.update("light", 0.2), "normal")
-        self.assertEqual(auto.update("light", 0.35), "light")      # slow for 0.3 s: go light
+        self.assertEqual(auto.update("light", 0.35), "light")      # struggling for 0.3 s: go light
         self.assertEqual(auto.update("normal", 1.0), "light")
-        self.assertEqual(auto.update("normal", 3.5), "light")      # not yet 3 s of keeping up
-        self.assertEqual(auto.update("normal", 4.1), "normal")
+        self.assertEqual(auto.update("normal", 5.5), "light")      # not yet 5 s of keeping up
+        self.assertEqual(auto.update("normal", 6.1), "normal")
 
-    def test_auto_does_not_flip_flop(self):
+    def test_waits_longer_after_full_size_failed_again(self):
         auto = server.MotionMode()
-        seen = {auto.update("light" if i % 2 else "normal", i * 0.05) for i in range(200)}
+        auto.update("light", 0.0); auto.update("light", 0.4)       # light
+        auto.update("normal", 1.0); auto.update("normal", 6.1)     # back to normal at 6.1 s
+        auto.update("light", 7.0); auto.update("light", 7.4)       # ...but it failed right away
+        self.assertEqual(auto.mode, "light")
+        auto.update("normal", 8.0)
+        self.assertEqual(auto.update("normal", 13.1), "light")     # 5 s is no longer enough
+        self.assertEqual(auto.update("normal", 18.1), "normal")    # it now waits 10 s
+
+    def test_never_flip_flops(self):
+        auto = server.MotionMode()
+        seen = {auto.update("light" if i % 2 else "normal", i * 0.05) for i in range(400)}
         self.assertEqual(seen, {"normal"})                          # a wobbly link never switches
+
+
+class NeighborhoodTests(unittest.TestCase):
+    def test_neighborhood_min(self):
+        a = np.full((5, 5), 9.0)
+        a[2, 2] = 1.0
+        out = tiles.neighborhood_min(a, 1)
+        self.assertEqual(out[1:4, 1:4].tolist(), [[1.0] * 3] * 3)   # the 3x3 around it
+        self.assertEqual(out[0, 0], 9.0)
 
 
 class PipelineTests(unittest.TestCase):
@@ -170,7 +192,6 @@ class PipelineTests(unittest.TestCase):
     def wait(self, seconds=10):
         """Pretend the screen has been still for a while."""
         self.hub.last_change -= seconds
-        self.hub.prev_change -= seconds
 
     def test_reconstruction_motion_then_refinement(self):
         h, w = 400, 640
@@ -229,9 +250,65 @@ class PipelineTests(unittest.TestCase):
             self.show(frame, prev)
             prev = frame
             job = self.pump()
-            if i >= 2:
+            if i >= 7:                               # once it's clearly a video, always moving quality
                 self.assertTrue(job.moving[1:3, 2:6].all(), f"video sent sharp at frame {i}")
         self.assertTrue(job.mask[5, 0] and not job.moving[5, 0])   # the typing went sharp
+
+    def test_a_video_pausing_for_a_moment_does_not_flash_sharp(self):
+        base = random_frame(400, 640, seed=10)
+        self.show(base, None)
+        self.pump()
+        self.wait()
+        prev = base
+        for i in range(60):                          # a video plays for 2 s (30 frames a second)...
+            self.hub.last_change -= 1 / 30
+            frame = prev.copy()
+            frame[64:256, 128:384, :3] = np.random.default_rng(60 + i).integers(0, 256, (192, 256, 3))
+            self.show(frame, prev)
+            prev = frame
+            self.pump()
+        self.hub.last_change -= 0.3                  # ...then holds still for 0.3 s:
+        job = self.pump()
+        self.assertTrue(job is None or not job.refine.any())   # no sharp flash
+        self.hub.last_change -= 1.0                  # really paused (over a second):
+        self.assertTrue(self.pump().refine[1:4, 2:6].all())    # now it sharpens
+
+    def test_typing_stays_sharp(self):
+        base = random_frame(400, 640, seed=9)
+        self.show(base, None)
+        self.pump()
+        self.wait()
+        prev = base
+        for i in range(10):                          # ten keystrokes into the same tile, 0.2 s apart
+            self.hub.last_change -= 0.2
+            frame = prev.copy()
+            frame[70:80, 70 + i * 5:74 + i * 5, :3] = 255
+            self.show(frame, prev)
+            prev = frame
+            job = self.pump()
+            self.assertTrue(job.sharp, f"keystroke {i} was sent soft")
+
+    def test_calm_parts_of_a_playing_video_are_not_sharpened_one_by_one(self):
+        # In light mode, calm patches of a video that got sharpened on their own made it blink.
+        base = random_frame(400, 640, seed=8)
+        self.show(base, None)
+        self.pump()
+        self.wait()
+        prev = base
+        for i in range(10):                          # the video area plays for a moment...
+            frame = prev.copy()
+            frame[64:256, 128:384, :3] = np.random.default_rng(40 + i).integers(0, 256, (192, 256, 3))
+            self.show(frame, prev)
+            prev = frame
+            self.pump()
+        self.hub.last_change[1:4, 2:4] -= 10         # ...its left half pauses for a while,
+        frame = prev.copy()                           # while its right half keeps moving
+        frame[64:256, 256:384, :3] = np.random.default_rng(99).integers(0, 256, (192, 128, 3))
+        self.show(frame, prev)
+        job = self.pump()
+        self.assertFalse(job.refine[1:4, 2:4].any())   # the paused half is not sharpened yet
+        self.wait()                                    # the whole video pauses:
+        self.assertTrue(self.pump().refine[1:4, 2:6].all())   # now it all sharpens together
 
     def test_old_pages_never_get_half_size_updates(self):
         # A page that doesn't stretch half-size updates would draw them in a corner (broken look).

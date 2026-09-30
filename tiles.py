@@ -41,6 +41,23 @@ def diff_mask(prev: np.ndarray | None, cur: np.ndarray, tile: int = TILE) -> np.
     return np.logical_or.reduceat(bands, np.arange(0, w, tile), axis=1)
 
 
+def neighborhood_min(values: np.ndarray, radius: int) -> np.ndarray:
+    """Each cell's smallest value within `radius` cells (a square window), e.g. to ask
+    "how long since anything around this tile last changed?"."""
+    h, w = values.shape
+    padded = np.pad(values.astype(float), radius, constant_values=np.inf)
+    out = values.astype(float)
+    for dy in range(2 * radius + 1):
+        for dx in range(2 * radius + 1):
+            np.minimum(out, padded[dy:dy + h, dx:dx + w], out=out)
+    return out
+
+
+def neighborhood_max(values: np.ndarray, radius: int) -> np.ndarray:
+    """Each cell's largest value within `radius` cells (a square window)."""
+    return -neighborhood_min(-values.astype(float), radius)
+
+
 def mask_to_rects(mask: np.ndarray, width: int, height: int, tile: int = TILE,
                   max_rects: int = 24) -> list[tuple[int, int, int, int]]:
     """Merge set tiles into pixel rectangles (x, y, w, h) clipped to the frame.

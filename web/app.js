@@ -25,8 +25,6 @@
     cmdAsCtrl: store.get('cmdAsCtrl') !== '0',
     showStats: store.get('showStats') === '1',
     autoFullscreen: store.get('autoFullscreen') !== '0',
-    // How to send moving content (scrolling, dragging): auto, or always sharp / normal / light.
-    motion: store.get('motion') || (store.get('sharpMotion') === '1' ? 'normal' : 'auto'),
   };
 
   let ws = null;
@@ -91,10 +89,9 @@
   }
 
   function sendHi() {
-    // scale: 1 tells the PC this page stretches half-size updates back to full size;
-    // motion is the "While moving" setting.
+    // scale: 1 tells the PC this page stretches half-size updates back to full size.
     send({ t: 'hi', vw: innerWidth, vh: innerHeight, sw: screen.width, sh: screen.height,
-           dpr: devicePixelRatio || 1, scale: 1, motion: opts.motion });
+           dpr: devicePixelRatio || 1, scale: 1 });
   }
 
   function connect() {
@@ -472,13 +469,6 @@
   bindToggle('opt-cmd', 'cmdAsCtrl', () => releaseKeys());
   bindToggle('opt-stats', 'showStats', () => { statsEl.hidden = !opts.showStats; });
   bindToggle('opt-fs', 'autoFullscreen', () => updateFullscreenUi());
-  const motionSelect = $('opt-motion');
-  motionSelect.value = opts.motion;
-  motionSelect.addEventListener('change', () => {
-    opts.motion = motionSelect.value;
-    store.set('motion', opts.motion);
-    sendHi();
-  });
   statsEl.hidden = !opts.showStats;
 
   // ----------------------------------------------------------- full screen

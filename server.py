@@ -45,7 +45,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.8"
+VERSION = "1.9"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -59,44 +59,59 @@ RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10))
 MAX_INFLIGHT = 2        # frames sent but not yet drawn by the iPad; keeps latency low on slow Wi-Fi
 REFINE_DELAY = 0.2      # a region must be still this long before it is re-sent sharp
 SHARP_FRACTION = 0.12   # a sudden change bigger than this share of the screen is sent as moving first
-ACTIVE_WINDOW = 0.5     # a tile that changes again within this long counts as moving (video, scrolling)
-MOTION_BUDGET = 0.045   # a moving update should be drawn on the iPad within this long, or go lighter
-FAST_MOTION_QUALITY = 80  # quality for moving content when the connection has plenty of room
-FAST_SIZE_FACTOR = 1.6  # roughly how much bigger that is than --motion-quality (65)
-MOTION_DOWN_HOLD = 0.3  # Auto goes to a lighter mode after the connection is too slow for this long...
-MOTION_UP_HOLD = 3.0    # ...and back to a sharper one only after it has kept up for this long
-MOTION_MODES = ("sharp", "normal", "light")   # best to lightest
+ACTIVITY_TAU = 0.5      # seconds over which a tile's "how often does it change" estimate fades
+BUSY_ACTIVITY = 6.0     # a tile (or a neighbour) changing ~12+ times a second is moving: video,
+                        # scrolling. Typing, even fast, and a blinking caret stay below that.
+QUIET_RADIUS = 2        # sharpen a tile only once the tiles this close to it have stopped changing too
+MOTION_BUDGET = 0.045   # a full-size moving update should be drawn on the iPad within this long
+DELAY_LIMIT = 0.070     # moving updates taking longer than this (PC screen -> iPad) mean it's falling behind
+PING_LIMIT = 0.030      # a ping above this, and well above the usual, means the Wi-Fi is queueing up
+MOTION_DOWN_HOLD = 0.3  # moving content goes light after the connection has struggled for this long...
+MOTION_UP_HOLD = 5.0    # ...and back to full size only after it has kept up for this long
+MOTION_UP_HOLD_MAX = 60.0  # (longer each time full size had to be given up again soon after)
+MOTION_MODES = ("normal", "light")   # full size, or half size (a quarter of the data)
 MONITOR_CHECK = 2.0     # seconds between checks for display changes
 CURSOR_HZ = 120
 
 
-def desired_motion_mode(changed_px: int, link_rate: float | None, bytes_per_px: float) -> str:
-    """The sharpest mode whose moving update would reach the iPad within MOTION_BUDGET."""
+def desired_motion_mode(changed_px: int, link_rate: float | None, bytes_per_px: float,
+                        delay: float | None = None, rtt: float = 0.0, base_rtt: float | None = None) -> str:
+    """Full size ("normal") only if it keeps delay and ping low; otherwise half size ("light")."""
+    if delay is not None and delay > DELAY_LIMIT:
+        return "light"                          # moving updates already arrive late
+    if base_rtt is not None and rtt > max(PING_LIMIT, 2.5 * base_rtt):
+        return "light"                          # big updates are backing up the Wi-Fi
     if link_rate is None:                       # nothing measured yet: assume a good connection
         return "normal"
-    full_size_time = changed_px * bytes_per_px / link_rate
-    if full_size_time * FAST_SIZE_FACTOR <= MOTION_BUDGET / 2:
-        return "sharp"
-    return "normal" if full_size_time <= MOTION_BUDGET else "light"
+    return "normal" if changed_px * bytes_per_px / link_rate <= MOTION_BUDGET else "light"
 
 
 class MotionMode:
-    """Auto mode for moving content that doesn't flip back and forth: it goes lighter soon
-    after the connection falls behind, and sharper again only once it has kept up a while."""
+    """Chooses how moving content is sent, keeping it steady: it goes light soon after the
+    connection struggles, and back to full size only after it has kept up for a while - longer
+    each time full size had to be given up again soon after, so it never bounces back and forth."""
 
     def __init__(self):
         self.mode = "normal"
         self.wanted: str | None = None
         self.wanted_since = 0.0
+        self.up_hold = MOTION_UP_HOLD
+        self.went_up_at = float("-inf")
 
     def update(self, desired: str, now: float) -> str:
         if desired == self.mode:
             self.wanted = None
+            if self.mode == "normal" and now - self.went_up_at > 60:
+                self.up_hold = MOTION_UP_HOLD   # full size has held up for a minute: trust it again
             return self.mode
         if desired != self.wanted:
             self.wanted, self.wanted_since = desired, now
-        lighter = MOTION_MODES.index(desired) > MOTION_MODES.index(self.mode)
-        if now - self.wanted_since >= (MOTION_DOWN_HOLD if lighter else MOTION_UP_HOLD):
+        lighter = desired == "light"
+        if now - self.wanted_since >= (MOTION_DOWN_HOLD if lighter else self.up_hold):
+            if lighter and now - self.went_up_at < 20:
+                self.up_hold = min(self.up_hold * 2, MOTION_UP_HOLD_MAX)
+            if not lighter:
+                self.went_up_at = now
             self.mode, self.wanted = desired, None
         return self.mode
 
@@ -273,7 +288,7 @@ class Hub:
             self.generation += 1
             self.frame = None
             self.last_change = np.zeros(tiles.grid_shape(*target.rect[2:]))
-            self.prev_change = np.zeros(tiles.grid_shape(*target.rect[2:]))
+            self.activity = np.zeros(tiles.grid_shape(*target.rect[2:]))   # decayed count of changes
         if announce:
             log.info("Streaming %s (capture: %s)", target.label, source_name)
             if hint:
@@ -286,7 +301,8 @@ class Hub:
                 return
             self.frame = img
             self.frame_shown_at = shown_at or time.perf_counter()
-            self.prev_change[mask] = self.last_change[mask]
+            since = now - self.last_change[mask]
+            self.activity[mask] = self.activity[mask] * np.exp(-since / ACTIVITY_TAU) + 1.0
             self.last_change[mask] = now
             for s in self.sessions:
                 if s.dirty is not None and s.dirty.shape == mask.shape:
@@ -313,15 +329,22 @@ class Hub:
             else:
                 mask = s.dirty
             s.dirty = np.zeros(grid, bool)
-            refine = s.lowq & ~mask & ((now - self.last_change) > REFINE_DELAY)
-            busy = (self.last_change - self.prev_change) < ACTIVE_WINDOW
+            still_for = now - self.last_change
+            activity = self.activity * np.exp(-still_for / ACTIVITY_TAU)
+            # Sharpen a tile only once it and everything around it has been still, and has stopped
+            # changing video-fast: calm patches of a playing video, or a video pausing for a
+            # moment, would otherwise flash sharp and go soft again (blinking).
+            quiet = ((tiles.neighborhood_min(still_for, QUIET_RADIUS) > REFINE_DELAY)
+                     & (tiles.neighborhood_max(activity, QUIET_RADIUS) < BUSY_ACTIVITY))
+            refine = s.lowq & ~mask & quiet
+            busy = tiles.neighborhood_max(activity, 1) >= BUSY_ACTIVITY
             frame, target, shown_at = self.frame, self.target, self.frame_shown_at
         if not mask.any() and not refine.any():
             return None
-        # Decide per tile, not per update: tiles that keep changing (a playing video, a scroll)
-        # always go at moving quality, so they don't flicker between sharp and soft as the
-        # amount of change per update wobbles. A change after a pause (typing, a click) goes
-        # sharp, unless it's a big sudden one (a new page), which goes as moving first.
+        # Decide per tile, not per update: tiles in an area that changes many times a second
+        # (a playing video, a scroll) always go at moving quality, so nothing flickers between
+        # sharp and soft. Other changes (typing, a click) go sharp, unless it's a big sudden
+        # one (a new page), which goes as moving first.
         if keyframe:
             moving = np.zeros(grid, bool)
         else:
@@ -466,10 +489,11 @@ class Session:
         self.link_rate: float | None = None     # bytes/s from sending an update to the iPad drawing it
         self.motion_bpp = 0.2                   # JPEG bytes per changed pixel of full-size moving content
         self.motion_mode = ""                   # how the last moving update went: sharp / normal / light
-        self.motion_pref = "auto"               # the page's "While moving" setting: auto or a fixed mode
         self.motion_auto = MotionMode()
+        self.moving_delays: deque[float] = deque(maxlen=15)   # delays of recent moving updates
+        self.base_rtt: float | None = None      # the lowest ping seen: what this Wi-Fi does when idle
         self.sent_at: dict[int, tuple[float, int]] = {}
-        self.drawn_at: dict[int, float] = {}   # frame id -> when the PC drew what it shows
+        self.drawn_at: dict[int, tuple[float, bool]] = {}   # frame id -> (when the PC drew it, moving?)
         self.delays: deque[float] = deque(maxlen=30)
         self.rtt = 0.0                          # network round trip, measured by the iPad
         self.last_delay_report = 0.0
@@ -506,27 +530,25 @@ class Session:
             if job.new_size:
                 await self.send_json(hub.size_message(job.target))
             quality, half = None, False
-            if not job.sharp:                      # moving content: the chosen mode, or Auto
+            if not job.sharp:                      # moving content: full or half size, chosen automatically
                 changed_px = int(job.moving.sum()) * tiles.TILE ** 2
-                mode = self.motion_pref
-                if mode not in MOTION_MODES:
-                    mode = self.motion_auto.update(
-                        desired_motion_mode(changed_px, self.link_rate, self.motion_bpp), time.monotonic())
+                recent = sorted(self.moving_delays)
+                delay = recent[len(recent) // 2] if len(recent) >= 5 else None
+                mode = self.motion_auto.update(
+                    desired_motion_mode(changed_px, self.link_rate, self.motion_bpp, delay, self.rtt, self.base_rtt),
+                    time.monotonic())
                 if mode == "light" and not self.can_scale:   # this page can't stretch half-size updates
                     mode = "normal"
                 self.motion_mode = mode
-                quality = FAST_MOTION_QUALITY if mode == "sharp" else hub.args.motion_quality
+                quality = hub.args.motion_quality
                 half = mode == "light"
             parts, motion_bytes = await hub.encode(job, quality, half)
             if quality and not half and motion_bytes:   # learn how big full-size moving updates are
-                bpp = motion_bytes / changed_px
-                if quality > hub.args.motion_quality:
-                    bpp /= FAST_SIZE_FACTOR
-                self.motion_bpp = 0.7 * self.motion_bpp + 0.3 * bpp
+                self.motion_bpp = 0.7 * self.motion_bpp + 0.3 * motion_bytes / changed_px
             flags = (tiles.FLAG_KEYFRAME if job.keyframe else 0) | (tiles.FLAG_SHARP if job.sharp else 0)
             self.frame_id = (self.frame_id + 1) & 0xFFFFFFFF
             if not job.keyframe and job.mask.any():   # new content (not a resend): measure its delay
-                self.drawn_at[self.frame_id] = job.shown_at
+                self.drawn_at[self.frame_id] = (job.shown_at, not job.sharp)
                 if len(self.drawn_at) > 64:
                     self.drawn_at.pop(next(iter(self.drawn_at)))
             payload = tiles.pack_frame(self.frame_id, parts, flags)
@@ -579,6 +601,8 @@ class Session:
             self.wake.set()
         elif t == "ping":
             self.rtt = max(0.0, float(m.get("rtt") or 0) / 1000)
+            if self.rtt > 0:
+                self.base_rtt = self.rtt if self.base_rtt is None else min(self.base_rtt, self.rtt)
             asyncio.ensure_future(self.send_json({"t": "pong", "ts": m.get("ts")}))
         elif t == "hi":
             self._greet(m)
@@ -588,17 +612,23 @@ class Session:
         if not sent:
             return
         sent_at, size = sent
-        took = time.perf_counter() - sent_at
+        # Leave out the round trip: it is the same for small and big updates, and counting it
+        # made small (light) updates look like a slow connection, which kept things light.
+        took = time.perf_counter() - sent_at - self.rtt
         if size >= 30_000 and took > 0.002:      # small updates say little about the connection
             rate = size / took
             self.link_rate = rate if self.link_rate is None else 0.8 * self.link_rate + 0.2 * rate
 
-    def _note_delay(self, drawn_at: float | None) -> None:
+    def _note_delay(self, drawn: tuple[float, bool] | None) -> None:
         """Screen-to-iPad delay: from the PC drawing a change to the iPad showing it."""
-        if not drawn_at:
+        if not drawn:
             return
+        drawn_at, moving = drawn
         # The ack left the iPad right after drawing, and took about half a round trip to arrive.
-        self.delays.append(max(0.0, time.perf_counter() - drawn_at - self.rtt / 2))
+        delay = max(0.0, time.perf_counter() - drawn_at - self.rtt / 2)
+        self.delays.append(delay)
+        if moving:
+            self.moving_delays.append(delay)
         now = time.monotonic()
         if now - self.last_delay_report >= 1.0:
             self.last_delay_report = now
@@ -607,8 +637,6 @@ class Session:
 
     def _greet(self, m: dict) -> None:
         self.can_scale = bool(m.get("scale"))
-        pref = str(m.get("motion") or "auto")
-        self.motion_pref = pref if pref in MOTION_MODES else "auto"
         dpr = float(m.get("dpr") or 1)
         sw, sh = int(m.get("sw") or 0), int(m.get("sh") or 0)
         landscape = int(m.get("vw") or 0) >= int(m.get("vh") or 0)

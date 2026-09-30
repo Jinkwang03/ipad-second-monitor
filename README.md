@@ -129,15 +129,6 @@ The **tab on the left edge** opens the menu, which has these options:
 - **Touch acts as a mouse:** for apps that don't handle touch well.
 - **⌘ key acts as Ctrl:** turn this off to send the Windows key instead.
 - **Full screen on first tap:** on by default. Turn it off if you'd rather stay windowed.
-- **While moving:** how scrolling and dragging windows or tabs are sent.
-  - **Auto** (default) picks the sharpest mode your Wi-Fi can deliver without lag. It
-    switches to a lighter mode soon after the Wi-Fi falls behind, and back only after 3
-    seconds of keeping up, so it doesn't flip back and forth.
-  - **Sharp**, **Normal** and **Light** fix it to that mode:
-    - *Sharp*: full resolution, high quality.
-    - *Normal*: full resolution.
-    - *Light*: half resolution, so it stays smooth on weak Wi-Fi.
-  - Whatever you pick, anything that moved turns fully sharp again 0.2 s after it stops.
 - **Full screen / Exit full screen:** switch by hand. After you exit here, taps aren't used
   to go back into full screen until you press *Full screen* again.
 
@@ -257,9 +248,9 @@ run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi
   - **delay** is the time from the PC drawing a change to the iPad showing it. Around
     30–60 ms is normal.
   - **ping** is the Wi-Fi's own share of that.
-  - **moving: sharp / normal / light** shows how scrolling and dragging are being sent right
-    now. *light* means the connection is too slow for full resolution. Try the tips below,
-    or set **While moving** to *Normal* or *Sharp* if you prefer sharpness over smoothness.
+  - **moving: normal / light** shows how scrolling, dragging and video are being sent right
+    now. It's chosen automatically to keep delay and ping low. *light* (half resolution)
+    means your Wi-Fi can't carry full resolution without lag; the tips below help.
 - For the least lag:
   - Use 5 GHz (or 6 GHz) Wi-Fi near the router, or the laptop's own Wi-Fi (the *iPad Display
     (own Wi-Fi)* shortcut). That links the laptop and iPad directly, without a router in
@@ -311,10 +302,13 @@ new version, change `VERSION` in `server.py`. Otherwise the current release is r
 - **Encoding**: frames are compared in 64 × 64 tiles. Only changed tiles are merged into
   rectangles and JPEG-encoded in parallel bands (libjpeg-turbo). Small changes like typing
   go out sharp right away (quality 90, full colour detail). Big changes like scrolling or
-  video are sent as sharp as your connection can deliver within about 45 ms. iPad Display
-  measures how fast the iPad takes in updates. It uses extra quality when there's room,
-  full resolution normally, and half resolution only on a slow link. Anything that moved is
-  re-sent sharp once it has been still for 0.2 s.
+  video are chosen automatically, for the least delay and ping. They go at full resolution
+  (*normal*) while that keeps up, and at half resolution (*light*) as soon as the measured
+  delay passes ~70 ms or the ping rises. iPad Display goes back to *normal* only after 5 s of
+  keeping up (longer if it had to give up again), so it doesn't switch back and forth.
+  Areas that change many times a second (video, scrolling) keep one steady quality. They're
+  re-sent sharp only once they have really stopped (about half a second), so a video never
+  blinks. Typing and clicks are always sent sharp.
 - **Flow control**: the iPad acknowledges each frame after drawing it, and the server
   keeps at most 2 frames in flight. A slow network means fewer updates rather than growing lag.
 - **Cursor**: sent separately as position plus shape, and drawn as an overlay on the iPad,
