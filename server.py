@@ -42,7 +42,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.5.1"
+VERSION = "1.6"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -54,11 +54,30 @@ IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp
 RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 MAX_INFLIGHT = 2        # frames sent but not yet drawn by the iPad; keeps latency low on slow Wi-Fi
-REFINE_DELAY = 0.3      # a region must be still this long before it is re-sent sharp
+REFINE_DELAY = 0.2      # a region must be still this long before it is re-sent sharp
 SHARP_FRACTION = 0.12   # updates covering less of the screen than this are sent sharp right away
-HALF_SIZE_FRACTION = 0.25  # bigger moving areas go at half resolution (1/4 of the data) until still
+MOTION_BUDGET = 0.045   # a moving update should be drawn on the iPad within this long, or go lighter
+FAST_MOTION_QUALITY = 80  # quality for moving content when the connection has plenty of room
+FAST_SIZE_FACTOR = 1.6  # roughly how much bigger that is than --motion-quality (65)
 MONITOR_CHECK = 2.0     # seconds between checks for display changes
 CURSOR_HZ = 120
+
+
+def plan_motion(changed_px: int, link_rate: float | None, bytes_per_px: float, base_quality: int,
+                can_scale: bool) -> tuple[int, bool, str]:
+    """How to send a moving update: (JPEG quality, half size?, label for the stats).
+
+    As sharp as the connection can deliver within MOTION_BUDGET: extra quality when there's
+    plenty of room, full size normally, and half size only when full size would arrive late.
+    """
+    if link_rate is None:                       # nothing measured yet: assume a good connection
+        return base_quality, False, "normal"
+    full_size_time = changed_px * bytes_per_px / link_rate
+    if full_size_time * FAST_SIZE_FACTOR <= MOTION_BUDGET / 2:
+        return max(base_quality, FAST_MOTION_QUALITY), False, "sharp"
+    if full_size_time <= MOTION_BUDGET or not can_scale:
+        return base_quality, False, "normal"
+    return base_quality, True, "light"
 
 
 @dataclass
@@ -279,20 +298,24 @@ class Hub:
         s.lowq[refine] = False
         return Job(frame, mask, refine, sharp, keyframe, new_size, target, shown_at)
 
-    async def encode(self, job: Job, allow_half: bool = False):
+    async def encode(self, job: Job, motion_quality: int | None = None, half: bool = False):
+        """JPEG-encode a job; returns ([(rect, jpeg), ...], bytes of the changed (non-refine) part).
+
+        Moving content uses `motion_quality`, and `half` sends it at half size (a quarter of the
+        data; the page stretches it back). Either way it is re-sent sharp once it stops moving.
+        """
         w, h = job.target.rect[2:]
-        q_sharp, q_motion = self.args.quality, self.args.motion_quality
-        # Big moving areas (scrolling, dragging, video) go at half size: a quarter of the data
-        # to send and decode, so they keep up. They're re-sent sharp once they stop moving.
-        # Only for pages that said they stretch them back (an old page would draw them wrong).
-        half = allow_half and not job.sharp and job.mask.mean() > HALF_SIZE_FRACTION
-        work = [(r, q_sharp if job.sharp else q_motion, job.sharp, half)
+        q_sharp = self.args.quality
+        q_motion = motion_quality or self.args.motion_quality
+        half = half and not job.sharp
+        main = [(r, q_sharp if job.sharp else q_motion, job.sharp, half)
                 for r in tiles.split_bands(tiles.mask_to_rects(job.mask, w, h))]
-        work += [(r, q_sharp, True, False) for r in tiles.split_bands(tiles.mask_to_rects(job.refine, w, h))]
+        work = main + [(r, q_sharp, True, False)
+                       for r in tiles.split_bands(tiles.mask_to_rects(job.refine, w, h))]
         loop = asyncio.get_running_loop()
         datas = await asyncio.gather(*(loop.run_in_executor(self.pool, tiles.encode_jpeg, job.frame, *item)
                                        for item in work))
-        return [(item[0], data) for item, data in zip(work, datas)]
+        return [(item[0], data) for item, data in zip(work, datas)], sum(len(d) for d in datas[:len(main)])
 
     def size_message(self, target: capture.Target) -> dict:
         w, h = target.rect[2:]
@@ -406,6 +429,10 @@ class Session:
         self.shapes_sent: set[int] = set()
         self.greeted = False
         self.can_scale = False                  # the page draws half-size updates stretched back
+        self.link_rate: float | None = None     # bytes/s from sending an update to the iPad drawing it
+        self.motion_bpp = 0.2                   # JPEG bytes per changed pixel of full-size moving content
+        self.motion_mode = ""                   # how the last moving update went: sharp / normal / light
+        self.sent_at: dict[int, tuple[float, int]] = {}
         self.drawn_at: dict[int, float] = {}   # frame id -> when the PC drew what it shows
         self.delays: deque[float] = deque(maxlen=30)
         self.rtt = 0.0                          # network round trip, measured by the iPad
@@ -442,15 +469,29 @@ class Session:
                 continue
             if job.new_size:
                 await self.send_json(hub.size_message(job.target))
-            parts = await hub.encode(job, allow_half=self.can_scale)
+            quality, half = None, False
+            if not job.sharp and job.mask.any():   # moving content: as sharp as the connection allows
+                changed_px = int(job.mask.sum()) * tiles.TILE ** 2
+                quality, half, self.motion_mode = plan_motion(
+                    changed_px, self.link_rate, self.motion_bpp, hub.args.motion_quality, self.can_scale)
+            parts, motion_bytes = await hub.encode(job, quality, half)
+            if quality and not half and motion_bytes:   # learn how big full-size moving updates are
+                bpp = motion_bytes / changed_px
+                if quality > hub.args.motion_quality:
+                    bpp /= FAST_SIZE_FACTOR
+                self.motion_bpp = 0.7 * self.motion_bpp + 0.3 * bpp
             flags = (tiles.FLAG_KEYFRAME if job.keyframe else 0) | (tiles.FLAG_SHARP if job.sharp else 0)
             self.frame_id = (self.frame_id + 1) & 0xFFFFFFFF
             if not job.keyframe and job.mask.any():   # new content (not a resend): measure its delay
                 self.drawn_at[self.frame_id] = job.shown_at
                 if len(self.drawn_at) > 64:
                     self.drawn_at.pop(next(iter(self.drawn_at)))
+            payload = tiles.pack_frame(self.frame_id, parts, flags)
+            self.sent_at[self.frame_id] = (time.perf_counter(), len(payload))
+            if len(self.sent_at) > 64:
+                self.sent_at.pop(next(iter(self.sent_at)))
             self.inflight += 1
-            await self.ws.send_bytes(tiles.pack_frame(self.frame_id, parts, flags))
+            await self.ws.send_bytes(payload)
 
     def queue_cursor(self, msg: dict) -> None:
         self.cursor_pending = msg
@@ -476,6 +517,7 @@ class Session:
             self.inflight = max(0, self.inflight - 1)
             self.last_ack = time.monotonic()
             self.wake.set()
+            self._note_rate(self.sent_at.pop(m.get("id"), None))
             self._note_delay(self.drawn_at.pop(m.get("id"), None))
         elif t == "p" and injector:
             pos = hub.to_screen(m["x"], m["y"])
@@ -498,6 +540,16 @@ class Session:
         elif t == "hi":
             self._greet(m)
 
+    def _note_rate(self, sent: tuple[float, int] | None) -> None:
+        """How fast the iPad takes updates in: bytes / (sending -> drawn), smoothed."""
+        if not sent:
+            return
+        sent_at, size = sent
+        took = time.perf_counter() - sent_at
+        if size >= 30_000 and took > 0.002:      # small updates say little about the connection
+            rate = size / took
+            self.link_rate = rate if self.link_rate is None else 0.8 * self.link_rate + 0.2 * rate
+
     def _note_delay(self, drawn_at: float | None) -> None:
         """Screen-to-iPad delay: from the PC drawing a change to the iPad showing it."""
         if not drawn_at:
@@ -508,7 +560,7 @@ class Session:
         if now - self.last_delay_report >= 1.0:
             self.last_delay_report = now
             ms = sorted(self.delays)[len(self.delays) // 2] * 1000
-            asyncio.ensure_future(self.send_json({"t": "lat", "ms": round(ms)}))
+            asyncio.ensure_future(self.send_json({"t": "lat", "ms": round(ms), "motion": self.motion_mode}))
 
     def _greet(self, m: dict) -> None:
         self.can_scale = bool(m.get("scale"))

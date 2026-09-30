@@ -126,6 +126,9 @@ The **tab on the left edge** opens the menu, which has these options:
 - **Touch acts as a mouse:** for apps that don't handle touch well.
 - **⌘ key acts as Ctrl:** turn this off to send the Windows key instead.
 - **Full screen on first tap:** on by default. Turn it off if you'd rather stay windowed.
+- **Sharp while moving:** always send moving content (scrolling, dragging windows or tabs)
+  at full resolution. Without it, iPad Display does this whenever your Wi-Fi is fast enough,
+  and only sends it lighter when it would otherwise lag.
 - **Full screen / Exit full screen:** switch by hand. After you exit here, taps aren't used
   to go back into full screen until you press *Full screen* again.
 
@@ -245,6 +248,9 @@ run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi
   - **delay** is the time from the PC drawing a change to the iPad showing it. Around
     30–60 ms is normal.
   - **ping** is the Wi-Fi's own share of that.
+  - **moving: sharp / normal / light** shows how scrolling and dragging are being sent right
+    now. *light* means the connection is too slow for full resolution. Try the tips below,
+    or turn on **Sharp while moving** if you prefer sharpness over smoothness.
 - For the least lag:
   - Use 5 GHz (or 6 GHz) Wi-Fi near the router, or the laptop's own Wi-Fi (the *iPad Display
     (own Wi-Fi)* shortcut). That links the laptop and iPad directly, without a router in
@@ -291,8 +297,10 @@ new version, change `VERSION` in `server.py`. Otherwise the current release is r
 - **Encoding**: frames are compared in 64 × 64 tiles. Only changed tiles are merged into
   rectangles and JPEG-encoded in parallel bands (libjpeg-turbo). Small changes like typing
   go out sharp right away (quality 90, full colour detail). Big changes like scrolling or
-  video go out lighter and at half resolution (a quarter of the data), then get re-sent
-  sharp once they've been still for 0.3 s.
+  video are sent as sharp as your connection can deliver within about 45 ms. iPad Display
+  measures how fast the iPad takes in updates. It uses extra quality when there's room,
+  full resolution normally, and half resolution only on a slow link. Anything that moved is
+  re-sent sharp once it has been still for 0.2 s.
 - **Flow control**: the iPad acknowledges each frame after drawing it, and the server
   keeps at most 2 frames in flight. A slow network means fewer updates rather than growing lag.
 - **Cursor**: sent separately as position plus shape, and drawn as an overlay on the iPad,

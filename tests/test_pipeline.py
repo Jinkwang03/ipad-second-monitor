@@ -107,6 +107,30 @@ def make_hub(w=640, h=400):
     return hub
 
 
+class MotionPlanTests(unittest.TestCase):
+    """Moving content is sent as sharp as the connection can deliver in time."""
+    PX = 2266 * 1488                               # the whole screen scrolling
+
+    def plan(self, rate, can_scale=True):
+        return server.plan_motion(self.PX, rate, 0.2, 65, can_scale)
+
+    def test_unknown_connection_starts_full_size(self):
+        self.assertEqual(self.plan(None), (65, False, "normal"))
+
+    def test_fast_connection_gets_extra_quality(self):
+        self.assertEqual(self.plan(100e6), (80, False, "sharp"))        # 100 MB/s
+
+    def test_ordinary_connection_stays_full_size(self):
+        self.assertEqual(self.plan(15e6), (65, False, "normal"))        # 674 KB in ~45 ms
+
+    def test_slow_connection_goes_half_size_only_if_the_page_can(self):
+        self.assertEqual(self.plan(5e6), (65, True, "light"))
+        self.assertEqual(self.plan(5e6, can_scale=False), (65, False, "normal"))
+
+    def test_small_changes_stay_sharp_even_on_slow_connections(self):
+        self.assertEqual(server.plan_motion(64 * 64 * 20, 5e6, 0.2, 65, True), (80, False, "sharp"))
+
+
 class PipelineTests(unittest.TestCase):
     """Drive Hub.take/encode like a session would and rebuild the picture from the tiles."""
 
@@ -123,7 +147,7 @@ class PipelineTests(unittest.TestCase):
         job = self.hub.take(self.session)
         if job is None:
             return None
-        parts = asyncio.run(self.hub.encode(job, allow_half=allow_half))
+        parts, _ = asyncio.run(self.hub.encode(job, half=allow_half))
         if self.canvas is None:
             w, h = job.target.rect[2:]
             self.canvas = np.zeros((h, w, 3), np.uint8)

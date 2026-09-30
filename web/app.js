@@ -25,6 +25,7 @@
     cmdAsCtrl: store.get('cmdAsCtrl') !== '0',
     showStats: store.get('showStats') === '1',
     autoFullscreen: store.get('autoFullscreen') !== '0',
+    sharpMotion: store.get('sharpMotion') === '1',   // never send moving content at half size
   };
 
   let ws = null;
@@ -36,7 +37,7 @@
   let streaming = false;
   let serverVersion = null;       // version of iPad Display this page was loaded from
   let reconnectTimer = 0, reconnectDelay = 500, pingTimer = 0;
-  const stats = { frames: 0, bytes: 0, since: performance.now(), rtt: 0, delay: null, text: '–' };
+  const stats = { frames: 0, bytes: 0, since: performance.now(), rtt: 0, delay: null, motion: '', text: '–' };
 
   // ---------------------------------------------------------------- status
 
@@ -89,8 +90,10 @@
   }
 
   function sendHi() {
-    // scale: 1 tells the PC this page stretches half-size updates back to full size.
-    send({ t: 'hi', vw: innerWidth, vh: innerHeight, sw: screen.width, sh: screen.height, dpr: devicePixelRatio || 1, scale: 1 });
+    // scale: 1 tells the PC this page stretches half-size updates back to full size, so it may
+    // send moving content that way when the connection is slow ("Sharp while moving" says no).
+    send({ t: 'hi', vw: innerWidth, vh: innerHeight, sw: screen.width, sh: screen.height,
+           dpr: devicePixelRatio || 1, scale: opts.sharpMotion ? 0 : 1 });
   }
 
   function connect() {
@@ -173,6 +176,7 @@
         break;
       case 'lat':                            // screen-to-iPad delay measured by the PC
         stats.delay = m.ms;
+        stats.motion = m.motion || '';
         break;
       case 'offer':                          // files dropped on the PC's "Drop files here" box
         if (m.files && m.files.length) showInbox(null, m.files, 'Sent from the PC');
@@ -467,6 +471,7 @@
   bindToggle('opt-cmd', 'cmdAsCtrl', () => releaseKeys());
   bindToggle('opt-stats', 'showStats', () => { statsEl.hidden = !opts.showStats; });
   bindToggle('opt-fs', 'autoFullscreen', () => updateFullscreenUi());
+  bindToggle('opt-sharp', 'sharpMotion', () => sendHi());
   statsEl.hidden = !opts.showStats;
 
   // ----------------------------------------------------------- full screen
@@ -711,7 +716,8 @@
   setInterval(() => {
     const now = performance.now(), dt = (now - stats.since) / 1000;
     const delay = stats.delay === null ? '' : ` · delay ${stats.delay} ms`;
-    stats.text = `${Math.round(stats.frames / dt)} upd/s · ${formatRate(stats.bytes / dt)}${delay} · ping ${Math.round(stats.rtt)} ms`;
+    const motion = stats.motion ? ` · moving: ${stats.motion}` : '';
+    stats.text = `${Math.round(stats.frames / dt)} upd/s · ${formatRate(stats.bytes / dt)}${delay} · ping ${Math.round(stats.rtt)} ms${motion}`;
     stats.frames = 0;
     stats.bytes = 0;
     stats.since = now;
