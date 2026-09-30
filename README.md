@@ -110,6 +110,9 @@ case the name doesn't work on some network.
 
 **Stop:** press Ctrl+C in the console, or close it.
 
+Only one copy runs at a time. If you start iPad Display (or *iPad Display (own Wi-Fi)*) while
+it's already running, the running copy closes and the new one takes over.
+
 ## Using it
 
 | On the iPad | What Windows gets |
@@ -265,6 +268,11 @@ run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi
     saving makes Wi-Fi respond in bursts.
   - Set the virtual display to the iPad's own resolution (setup step 2), so nothing is scaled.
   - On weak Wi-Fi, try `--motion-quality 50`.
+
+**"Port 8765 is already used by …"**: another program is using iPad Display's port.
+- If it's an older copy of iPad Display, starting the new one closes it automatically.
+- If it's a different program, close it, or start iPad Display with `--port 8766`. Then use
+  `:8766` in the iPad address too.
 
 **The iPad screen turns off**: iPadOS doesn't let a plain web page keep the screen on.
 Set *Settings → Display & Brightness → Auto-Lock* to *Never* while you use it.

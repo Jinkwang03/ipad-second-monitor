@@ -19,7 +19,10 @@ import os
 import re
 import secrets
 import signal
+import socket
+import subprocess
 import sys
+import urllib.request
 import threading
 import time
 from collections import deque
@@ -42,7 +45,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.7"
+VERSION = "1.8"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -55,7 +58,8 @@ RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10))
 
 MAX_INFLIGHT = 2        # frames sent but not yet drawn by the iPad; keeps latency low on slow Wi-Fi
 REFINE_DELAY = 0.2      # a region must be still this long before it is re-sent sharp
-SHARP_FRACTION = 0.12   # updates covering less of the screen than this are sent sharp right away
+SHARP_FRACTION = 0.12   # a sudden change bigger than this share of the screen is sent as moving first
+ACTIVE_WINDOW = 0.5     # a tile that changes again within this long counts as moving (video, scrolling)
 MOTION_BUDGET = 0.045   # a moving update should be drawn on the iPad within this long, or go lighter
 FAST_MOTION_QUALITY = 80  # quality for moving content when the connection has plenty of room
 FAST_SIZE_FACTOR = 1.6  # roughly how much bigger that is than --motion-quality (65)
@@ -107,6 +111,7 @@ class Job:
     new_size: bool
     target: capture.Target
     shown_at: float = 0.0   # perf_counter time the PC drew this frame
+    moving: np.ndarray | None = None   # changed tiles to send at moving quality (the rest go sharp)
 
 
 class Hub:
@@ -268,6 +273,7 @@ class Hub:
             self.generation += 1
             self.frame = None
             self.last_change = np.zeros(tiles.grid_shape(*target.rect[2:]))
+            self.prev_change = np.zeros(tiles.grid_shape(*target.rect[2:]))
         if announce:
             log.info("Streaming %s (capture: %s)", target.label, source_name)
             if hint:
@@ -280,6 +286,7 @@ class Hub:
                 return
             self.frame = img
             self.frame_shown_at = shown_at or time.perf_counter()
+            self.prev_change[mask] = self.last_change[mask]
             self.last_change[mask] = now
             for s in self.sessions:
                 if s.dirty is not None and s.dirty.shape == mask.shape:
@@ -307,13 +314,24 @@ class Hub:
                 mask = s.dirty
             s.dirty = np.zeros(grid, bool)
             refine = s.lowq & ~mask & ((now - self.last_change) > REFINE_DELAY)
+            busy = (self.last_change - self.prev_change) < ACTIVE_WINDOW
             frame, target, shown_at = self.frame, self.target, self.frame_shown_at
         if not mask.any() and not refine.any():
             return None
-        sharp = keyframe or mask.mean() <= SHARP_FRACTION
-        s.lowq[mask] = not sharp
+        # Decide per tile, not per update: tiles that keep changing (a playing video, a scroll)
+        # always go at moving quality, so they don't flicker between sharp and soft as the
+        # amount of change per update wobbles. A change after a pause (typing, a click) goes
+        # sharp, unless it's a big sudden one (a new page), which goes as moving first.
+        if keyframe:
+            moving = np.zeros(grid, bool)
+        else:
+            moving = mask & busy
+            calm = mask & ~moving
+            if calm.mean() > SHARP_FRACTION:
+                moving |= calm
+        s.lowq[mask] = moving[mask]
         s.lowq[refine] = False
-        return Job(frame, mask, refine, sharp, keyframe, new_size, target, shown_at)
+        return Job(frame, mask, refine, not moving.any(), keyframe, new_size, target, shown_at, moving)
 
     async def encode(self, job: Job, motion_quality: int | None = None, half: bool = False):
         """JPEG-encode a job; returns ([(rect, jpeg), ...], bytes of the changed (non-refine) part).
@@ -324,11 +342,10 @@ class Hub:
         w, h = job.target.rect[2:]
         q_sharp = self.args.quality
         q_motion = motion_quality or self.args.motion_quality
-        half = half and not job.sharp
-        main = [(r, q_sharp if job.sharp else q_motion, job.sharp, half)
-                for r in tiles.split_bands(tiles.mask_to_rects(job.mask, w, h))]
-        work = main + [(r, q_sharp, True, False)
-                       for r in tiles.split_bands(tiles.mask_to_rects(job.refine, w, h))]
+        moving = job.moving if job.moving is not None else np.zeros_like(job.mask)
+        main = [(r, q_motion, False, half) for r in tiles.split_bands(tiles.mask_to_rects(moving, w, h))]
+        still = (job.mask & ~moving) | job.refine        # calm changes and sharpening, both at full quality
+        work = main + [(r, q_sharp, True, False) for r in tiles.split_bands(tiles.mask_to_rects(still, w, h))]
         loop = asyncio.get_running_loop()
         datas = await asyncio.gather(*(loop.run_in_executor(self.pool, tiles.encode_jpeg, job.frame, *item)
                                        for item in work))
@@ -489,8 +506,8 @@ class Session:
             if job.new_size:
                 await self.send_json(hub.size_message(job.target))
             quality, half = None, False
-            if not job.sharp and job.mask.any():   # moving content: the chosen mode, or Auto
-                changed_px = int(job.mask.sum()) * tiles.TILE ** 2
+            if not job.sharp:                      # moving content: the chosen mode, or Auto
+                changed_px = int(job.moving.sum()) * tiles.TILE ** 2
                 mode = self.motion_pref
                 if mode not in MOTION_MODES:
                     mode = self.motion_auto.update(
@@ -786,6 +803,21 @@ async def handle_clipboard_file(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path, headers=headers)
 
 
+async def handle_status(request: web.Request) -> web.Response:
+    """Lets a newly started iPad Display recognise an already running one on this port."""
+    return web.json_response({"app": "iPad Display", "version": VERSION})
+
+
+async def handle_quit(request: web.Request) -> web.Response:
+    """Another iPad Display is starting on this port: shut down cleanly so it can take over."""
+    check_key(request)
+    if request.remote not in ("127.0.0.1", "::1"):
+        raise web.HTTPForbidden(text="only from this PC")
+    log.info("iPad Display was started again, so this copy is closing and the new one takes over.")
+    asyncio.get_running_loop().call_later(0.3, signal.raise_signal, signal.SIGINT)   # like Ctrl+C
+    return web.json_response({"ok": True})
+
+
 def make_icon(size: int = 180) -> bytes:
     img = Image.new("RGB", (size, size), (15, 23, 42))
     d = ImageDraw.Draw(img)
@@ -809,6 +841,8 @@ def make_app(hub: Hub) -> web.Application:
     app.router.add_get("/icon.png", handle_icon)
     app.router.add_get("/manifest.json", handle_manifest)
     app.router.add_get(r"/{name:(app\.js|style\.css)}", handle_static)
+    app.router.add_get("/status", handle_status)
+    app.router.add_post("/quit", handle_quit)
     app.router.add_post("/upload", handle_upload)
     app.router.add_post("/saved", handle_saved)
     app.router.add_get("/clipboard", handle_clipboard)
@@ -921,6 +955,64 @@ def network_addresses() -> list[tuple[str, str]]:
         found = [("Network", ip) for ip in sorted(mdns.local_ipv4())]
     default = mdns.route_ip("10.254.254.254")
     return sorted(found, key=lambda net: net[1] != default)
+
+
+def port_in_use(port: int) -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", port), 0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def port_owner(port: int) -> tuple[int | None, str]:
+    """(pid, program name) of whatever listens on this TCP port, from netstat/tasklist."""
+    if not IS_WINDOWS:
+        return None, ""
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
+                             errors="replace", timeout=10).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[2] in ("0.0.0.0:0", "[::]:0"):
+                pid = int(parts[-1])
+                row = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True,
+                                     text=True, errors="replace", timeout=10).stdout.strip()
+                return pid, row.split('","')[0].strip('"') if row.startswith('"') else ""
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None, ""
+
+
+def take_over_port(args, key: str) -> None:
+    """If iPad Display is already running on our port, close that copy so this one can start.
+
+    Newer copies are asked to shut down cleanly (they also turn off a hotspot they started);
+    an older copy that doesn't know how is closed directly. Other programs are left alone.
+    """
+    if not port_in_use(args.port):
+        return
+    base = f"http://127.0.0.1:{args.port}"
+    closed = False
+    try:
+        with urllib.request.urlopen(base + "/status", timeout=2) as r:
+            if json.loads(r.read()).get("app") == "iPad Display":
+                urllib.request.urlopen(urllib.request.Request(f"{base}/quit?key={quote(key)}", method="POST"),
+                                       timeout=3).read()
+                closed = True
+    except (OSError, ValueError):
+        pass
+    if not closed:
+        pid, name = port_owner(args.port)
+        if pid and name.lower() == "ipaddisplay.exe":
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=10)
+            closed = True
+    if closed:
+        print("\n  iPad Display was already running, so that copy was closed and this one takes over.")
+        for _ in range(50):                      # wait (up to 10 s) for it to let go of the port
+            if not port_in_use(args.port):
+                break
+            time.sleep(0.2)
 
 
 def hotspot_allowed(args) -> bool:
@@ -1075,6 +1167,7 @@ def main(argv=None) -> None:
     except LookupError as exc:
         sys.exit(str(exc))
     key = load_key(args)
+    take_over_port(args, key)
     hub = Hub(args, key)
     app = make_app(hub)
 
@@ -1108,7 +1201,10 @@ def main(argv=None) -> None:
     try:
         web.run_app(app, host=args.host, port=args.port, print=None, access_log=None)
     except OSError as exc:
-        sys.exit(f"Could not listen on port {args.port}: {exc}. Is it already running? Try --port 8766.")
+        pid, name = port_owner(args.port)
+        who = f"{name} (PID {pid})" if name else "another program"
+        sys.exit(f"Port {args.port} is already used by {who}, so iPad Display can't start ({exc}).\n"
+                 f"Close that program, or start iPad Display on another port: iPadDisplay.exe --port 8766")
     finally:
         if hub.hotspot_started:
             print("Turning off the laptop's Wi-Fi hotspot...")

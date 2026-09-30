@@ -167,6 +167,11 @@ class PipelineTests(unittest.TestCase):
     def show(self, frame, prev):
         self.hub._publish(frame, tiles.diff_mask(prev, frame), now=time.monotonic())
 
+    def wait(self, seconds=10):
+        """Pretend the screen has been still for a while."""
+        self.hub.last_change -= seconds
+        self.hub.prev_change -= seconds
+
     def test_reconstruction_motion_then_refinement(self):
         h, w = 400, 640
         base = random_frame(h, w, seed=2)
@@ -174,8 +179,9 @@ class PipelineTests(unittest.TestCase):
         job = self.pump()
         self.assertTrue(job.keyframe and job.sharp and job.new_size)
         self.assertGreater(psnr(self.canvas, base[..., 2::-1]), MIN_PSNR)
+        self.wait()
 
-        # Small change: sent sharp immediately.
+        # Small change after a pause: sent sharp immediately.
         small = base.copy()
         small[10:20, 10:20, :3] = 255
         self.show(small, base)
@@ -204,6 +210,28 @@ class PipelineTests(unittest.TestCase):
         refined_psnr = psnr(self.canvas, prev[..., 2::-1])
         self.assertGreater(refined_psnr, 45)         # ...then sharp once still (q90 4:4:4 ~53 dB)
         self.assertIsNone(self.pump())
+
+    def test_a_playing_video_keeps_one_quality(self):
+        # A video around 12% of the screen used to flip between sharp and soft every few frames,
+        # because each update was judged by its total size. Now tiles that keep changing stay
+        # at moving quality, and a change elsewhere after a pause (typing) is still sharp.
+        base = random_frame(400, 640, seed=7)        # 7 x 10 tiles
+        self.show(base, None)
+        self.pump()
+        self.wait()
+        prev = base
+        for i in range(12):
+            frame = prev.copy()
+            rows = 3 if i % 2 else 2                 # 12 or 8 of 70 tiles: either side of 12%
+            frame[64:64 + 64 * rows, 128:384, :3] = np.random.default_rng(i).integers(0, 256, (64 * rows, 256, 3))
+            if i == 11:
+                frame[320:330, 5:15, :3] = 255       # someone types in a corner that was still
+            self.show(frame, prev)
+            prev = frame
+            job = self.pump()
+            if i >= 2:
+                self.assertTrue(job.moving[1:3, 2:6].all(), f"video sent sharp at frame {i}")
+        self.assertTrue(job.mask[5, 0] and not job.moving[5, 0])   # the typing went sharp
 
     def test_old_pages_never_get_half_size_updates(self):
         # A page that doesn't stretch half-size updates would draw them in a corner (broken look).
