@@ -34,6 +34,7 @@
   let display = null;             // latest 'size' message
   let drawChain = Promise.resolve();
   let streaming = false;
+  let serverVersion = null;       // version of iPad Display this page was loaded from
   let reconnectTimer = 0, reconnectDelay = 500, pingTimer = 0;
   const stats = { frames: 0, bytes: 0, since: performance.now(), rtt: 0, delay: null, text: '–' };
 
@@ -88,7 +89,8 @@
   }
 
   function sendHi() {
-    send({ t: 'hi', vw: innerWidth, vh: innerHeight, sw: screen.width, sh: screen.height, dpr: devicePixelRatio || 1 });
+    // scale: 1 tells the PC this page stretches half-size updates back to full size.
+    send({ t: 'hi', vw: innerWidth, vh: innerHeight, sw: screen.width, sh: screen.height, dpr: devicePixelRatio || 1, scale: 1 });
   }
 
   function connect() {
@@ -135,6 +137,9 @@
   function onText(m) {
     switch (m.t) {
       case 'hello':
+        // iPad Display was updated while this page stayed open: reload to get the matching page.
+        if (serverVersion && m.v && m.v !== serverVersion) { location.reload(); return; }
+        serverVersion = m.v || serverVersion;
         if (m.saveDir) saveDir = m.saveDir;
         store.set('key', key);
         if (params.get('key') !== key) {  // keep "Add to Home Screen" pointing at a working key

@@ -117,11 +117,13 @@ class PipelineTests(unittest.TestCase):
         self.canvas = None
         self.half_sized = 0
 
-    def pump(self):
+    def pump(self, allow_half=True):
+        """Take and encode the next update like a session would, as a page that can (or can't)
+        stretch half-size updates, and draw it onto self.canvas."""
         job = self.hub.take(self.session)
         if job is None:
             return None
-        parts = asyncio.run(self.hub.encode(job))
+        parts = asyncio.run(self.hub.encode(job, allow_half=allow_half))
         if self.canvas is None:
             w, h = job.target.rect[2:]
             self.canvas = np.zeros((h, w, 3), np.uint8)
@@ -174,6 +176,20 @@ class PipelineTests(unittest.TestCase):
         refined_psnr = psnr(self.canvas, prev[..., 2::-1])
         self.assertGreater(refined_psnr, 45)         # ...then sharp once still (q90 4:4:4 ~53 dB)
         self.assertIsNone(self.pump())
+
+    def test_old_pages_never_get_half_size_updates(self):
+        # A page that doesn't stretch half-size updates would draw them in a corner (broken look).
+        prev = random_frame(400, 640, seed=5)
+        self.show(prev, None)
+        self.pump(allow_half=False)
+        for i in range(3):
+            frame = random_frame(400, 640, seed=20 + i)
+            self.show(frame, prev)
+            prev = frame
+            job = self.pump(allow_half=False)
+            self.assertFalse(job.sharp)          # big motion...
+        self.assertEqual(self.half_sized, 0)     # ...but always full size for this page
+        self.assertGreater(psnr(self.canvas, prev[..., 2::-1]), 20)
 
     def test_display_change_forces_keyframe(self):
         base = random_frame(400, 640, seed=3)

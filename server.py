@@ -42,7 +42,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.5"
+VERSION = "1.5.1"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -279,12 +279,13 @@ class Hub:
         s.lowq[refine] = False
         return Job(frame, mask, refine, sharp, keyframe, new_size, target, shown_at)
 
-    async def encode(self, job: Job):
+    async def encode(self, job: Job, allow_half: bool = False):
         w, h = job.target.rect[2:]
         q_sharp, q_motion = self.args.quality, self.args.motion_quality
         # Big moving areas (scrolling, dragging, video) go at half size: a quarter of the data
         # to send and decode, so they keep up. They're re-sent sharp once they stop moving.
-        half = not job.sharp and job.mask.mean() > HALF_SIZE_FRACTION
+        # Only for pages that said they stretch them back (an old page would draw them wrong).
+        half = allow_half and not job.sharp and job.mask.mean() > HALF_SIZE_FRACTION
         work = [(r, q_sharp if job.sharp else q_motion, job.sharp, half)
                 for r in tiles.split_bands(tiles.mask_to_rects(job.mask, w, h))]
         work += [(r, q_sharp, True, False) for r in tiles.split_bands(tiles.mask_to_rects(job.refine, w, h))]
@@ -404,6 +405,7 @@ class Session:
         self.cursor_pending: dict | None = None
         self.shapes_sent: set[int] = set()
         self.greeted = False
+        self.can_scale = False                  # the page draws half-size updates stretched back
         self.drawn_at: dict[int, float] = {}   # frame id -> when the PC drew what it shows
         self.delays: deque[float] = deque(maxlen=30)
         self.rtt = 0.0                          # network round trip, measured by the iPad
@@ -440,7 +442,7 @@ class Session:
                 continue
             if job.new_size:
                 await self.send_json(hub.size_message(job.target))
-            parts = await hub.encode(job)
+            parts = await hub.encode(job, allow_half=self.can_scale)
             flags = (tiles.FLAG_KEYFRAME if job.keyframe else 0) | (tiles.FLAG_SHARP if job.sharp else 0)
             self.frame_id = (self.frame_id + 1) & 0xFFFFFFFF
             if not job.keyframe and job.mask.any():   # new content (not a resend): measure its delay
@@ -509,6 +511,7 @@ class Session:
             asyncio.ensure_future(self.send_json({"t": "lat", "ms": round(ms)}))
 
     def _greet(self, m: dict) -> None:
+        self.can_scale = bool(m.get("scale"))
         dpr = float(m.get("dpr") or 1)
         sw, sh = int(m.get("sw") or 0), int(m.get("sh") or 0)
         landscape = int(m.get("vw") or 0) >= int(m.get("vh") or 0)
