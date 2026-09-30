@@ -126,9 +126,15 @@ The **tab on the left edge** opens the menu, which has these options:
 - **Touch acts as a mouse:** for apps that don't handle touch well.
 - **⌘ key acts as Ctrl:** turn this off to send the Windows key instead.
 - **Full screen on first tap:** on by default. Turn it off if you'd rather stay windowed.
-- **Sharp while moving:** always send moving content (scrolling, dragging windows or tabs)
-  at full resolution. Without it, iPad Display does this whenever your Wi-Fi is fast enough,
-  and only sends it lighter when it would otherwise lag.
+- **While moving:** how scrolling and dragging windows or tabs are sent.
+  - **Auto** (default) picks the sharpest mode your Wi-Fi can deliver without lag. It
+    switches to a lighter mode soon after the Wi-Fi falls behind, and back only after 3
+    seconds of keeping up, so it doesn't flip back and forth.
+  - **Sharp**, **Normal** and **Light** fix it to that mode:
+    - *Sharp*: full resolution, high quality.
+    - *Normal*: full resolution.
+    - *Light*: half resolution, so it stays smooth on weak Wi-Fi.
+  - Whatever you pick, anything that moved turns fully sharp again 0.2 s after it stops.
 - **Full screen / Exit full screen:** switch by hand. After you exit here, taps aren't used
   to go back into full screen until you press *Full screen* again.
 
@@ -250,7 +256,7 @@ run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi
   - **ping** is the Wi-Fi's own share of that.
   - **moving: sharp / normal / light** shows how scrolling and dragging are being sent right
     now. *light* means the connection is too slow for full resolution. Try the tips below,
-    or turn on **Sharp while moving** if you prefer sharpness over smoothness.
+    or set **While moving** to *Normal* or *Sharp* if you prefer sharpness over smoothness.
 - For the least lag:
   - Use 5 GHz (or 6 GHz) Wi-Fi near the router, or the laptop's own Wi-Fi (the *iPad Display
     (own Wi-Fi)* shortcut). That links the laptop and iPad directly, without a router in

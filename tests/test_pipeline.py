@@ -107,28 +107,32 @@ def make_hub(w=640, h=400):
     return hub
 
 
-class MotionPlanTests(unittest.TestCase):
-    """Moving content is sent as sharp as the connection can deliver in time."""
+class MotionModeTests(unittest.TestCase):
+    """Moving content goes as sharp as the connection delivers in time, without flip-flopping."""
     PX = 2266 * 1488                               # the whole screen scrolling
 
-    def plan(self, rate, can_scale=True):
-        return server.plan_motion(self.PX, rate, 0.2, 65, can_scale)
+    def desired(self, rate):
+        return server.desired_motion_mode(self.PX, rate, 0.2)
 
-    def test_unknown_connection_starts_full_size(self):
-        self.assertEqual(self.plan(None), (65, False, "normal"))
+    def test_mode_follows_connection_speed(self):
+        self.assertEqual(self.desired(None), "normal")     # nothing measured yet
+        self.assertEqual(self.desired(100e6), "sharp")     # 100 MB/s: room for extra quality
+        self.assertEqual(self.desired(15e6), "normal")     # 674 KB in ~45 ms
+        self.assertEqual(self.desired(5e6), "light")       # too slow for full size
 
-    def test_fast_connection_gets_extra_quality(self):
-        self.assertEqual(self.plan(100e6), (80, False, "sharp"))        # 100 MB/s
+    def test_auto_goes_lighter_quickly_but_recovers_slowly(self):
+        auto = server.MotionMode()
+        self.assertEqual(auto.update("light", 0.0), "normal")
+        self.assertEqual(auto.update("light", 0.2), "normal")
+        self.assertEqual(auto.update("light", 0.35), "light")      # slow for 0.3 s: go light
+        self.assertEqual(auto.update("normal", 1.0), "light")
+        self.assertEqual(auto.update("normal", 3.5), "light")      # not yet 3 s of keeping up
+        self.assertEqual(auto.update("normal", 4.1), "normal")
 
-    def test_ordinary_connection_stays_full_size(self):
-        self.assertEqual(self.plan(15e6), (65, False, "normal"))        # 674 KB in ~45 ms
-
-    def test_slow_connection_goes_half_size_only_if_the_page_can(self):
-        self.assertEqual(self.plan(5e6), (65, True, "light"))
-        self.assertEqual(self.plan(5e6, can_scale=False), (65, False, "normal"))
-
-    def test_small_changes_stay_sharp_even_on_slow_connections(self):
-        self.assertEqual(server.plan_motion(64 * 64 * 20, 5e6, 0.2, 65, True), (80, False, "sharp"))
+    def test_auto_does_not_flip_flop(self):
+        auto = server.MotionMode()
+        seen = {auto.update("light" if i % 2 else "normal", i * 0.05) for i in range(200)}
+        self.assertEqual(seen, {"normal"})                          # a wobbly link never switches
 
 
 class PipelineTests(unittest.TestCase):

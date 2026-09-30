@@ -42,7 +42,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.6"
+VERSION = "1.7"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -59,25 +59,42 @@ SHARP_FRACTION = 0.12   # updates covering less of the screen than this are sent
 MOTION_BUDGET = 0.045   # a moving update should be drawn on the iPad within this long, or go lighter
 FAST_MOTION_QUALITY = 80  # quality for moving content when the connection has plenty of room
 FAST_SIZE_FACTOR = 1.6  # roughly how much bigger that is than --motion-quality (65)
+MOTION_DOWN_HOLD = 0.3  # Auto goes to a lighter mode after the connection is too slow for this long...
+MOTION_UP_HOLD = 3.0    # ...and back to a sharper one only after it has kept up for this long
+MOTION_MODES = ("sharp", "normal", "light")   # best to lightest
 MONITOR_CHECK = 2.0     # seconds between checks for display changes
 CURSOR_HZ = 120
 
 
-def plan_motion(changed_px: int, link_rate: float | None, bytes_per_px: float, base_quality: int,
-                can_scale: bool) -> tuple[int, bool, str]:
-    """How to send a moving update: (JPEG quality, half size?, label for the stats).
-
-    As sharp as the connection can deliver within MOTION_BUDGET: extra quality when there's
-    plenty of room, full size normally, and half size only when full size would arrive late.
-    """
+def desired_motion_mode(changed_px: int, link_rate: float | None, bytes_per_px: float) -> str:
+    """The sharpest mode whose moving update would reach the iPad within MOTION_BUDGET."""
     if link_rate is None:                       # nothing measured yet: assume a good connection
-        return base_quality, False, "normal"
+        return "normal"
     full_size_time = changed_px * bytes_per_px / link_rate
     if full_size_time * FAST_SIZE_FACTOR <= MOTION_BUDGET / 2:
-        return max(base_quality, FAST_MOTION_QUALITY), False, "sharp"
-    if full_size_time <= MOTION_BUDGET or not can_scale:
-        return base_quality, False, "normal"
-    return base_quality, True, "light"
+        return "sharp"
+    return "normal" if full_size_time <= MOTION_BUDGET else "light"
+
+
+class MotionMode:
+    """Auto mode for moving content that doesn't flip back and forth: it goes lighter soon
+    after the connection falls behind, and sharper again only once it has kept up a while."""
+
+    def __init__(self):
+        self.mode = "normal"
+        self.wanted: str | None = None
+        self.wanted_since = 0.0
+
+    def update(self, desired: str, now: float) -> str:
+        if desired == self.mode:
+            self.wanted = None
+            return self.mode
+        if desired != self.wanted:
+            self.wanted, self.wanted_since = desired, now
+        lighter = MOTION_MODES.index(desired) > MOTION_MODES.index(self.mode)
+        if now - self.wanted_since >= (MOTION_DOWN_HOLD if lighter else MOTION_UP_HOLD):
+            self.mode, self.wanted = desired, None
+        return self.mode
 
 
 @dataclass
@@ -432,6 +449,8 @@ class Session:
         self.link_rate: float | None = None     # bytes/s from sending an update to the iPad drawing it
         self.motion_bpp = 0.2                   # JPEG bytes per changed pixel of full-size moving content
         self.motion_mode = ""                   # how the last moving update went: sharp / normal / light
+        self.motion_pref = "auto"               # the page's "While moving" setting: auto or a fixed mode
+        self.motion_auto = MotionMode()
         self.sent_at: dict[int, tuple[float, int]] = {}
         self.drawn_at: dict[int, float] = {}   # frame id -> when the PC drew what it shows
         self.delays: deque[float] = deque(maxlen=30)
@@ -470,10 +489,17 @@ class Session:
             if job.new_size:
                 await self.send_json(hub.size_message(job.target))
             quality, half = None, False
-            if not job.sharp and job.mask.any():   # moving content: as sharp as the connection allows
+            if not job.sharp and job.mask.any():   # moving content: the chosen mode, or Auto
                 changed_px = int(job.mask.sum()) * tiles.TILE ** 2
-                quality, half, self.motion_mode = plan_motion(
-                    changed_px, self.link_rate, self.motion_bpp, hub.args.motion_quality, self.can_scale)
+                mode = self.motion_pref
+                if mode not in MOTION_MODES:
+                    mode = self.motion_auto.update(
+                        desired_motion_mode(changed_px, self.link_rate, self.motion_bpp), time.monotonic())
+                if mode == "light" and not self.can_scale:   # this page can't stretch half-size updates
+                    mode = "normal"
+                self.motion_mode = mode
+                quality = FAST_MOTION_QUALITY if mode == "sharp" else hub.args.motion_quality
+                half = mode == "light"
             parts, motion_bytes = await hub.encode(job, quality, half)
             if quality and not half and motion_bytes:   # learn how big full-size moving updates are
                 bpp = motion_bytes / changed_px
@@ -564,6 +590,8 @@ class Session:
 
     def _greet(self, m: dict) -> None:
         self.can_scale = bool(m.get("scale"))
+        pref = str(m.get("motion") or "auto")
+        self.motion_pref = pref if pref in MOTION_MODES else "auto"
         dpr = float(m.get("dpr") or 1)
         sw, sh = int(m.get("sw") or 0), int(m.get("sh") or 0)
         landscape = int(m.get("vw") or 0) >= int(m.get("vh") or 0)

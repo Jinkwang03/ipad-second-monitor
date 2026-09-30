@@ -263,6 +263,15 @@ button.ghost { background: none; border: 0; padding: 4px 8px; color: var(--muted
 #panel .buttons button { flex: 1; }
 
 .toggle { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+.choice { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 0; }
+.choice select {
+  font: inherit;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 8px;
+}
 .toggle input { width: 20px; height: 20px; accent-color: var(--accent); margin: 0; }
 
 #notice {

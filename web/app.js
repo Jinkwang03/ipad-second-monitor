@@ -25,7 +25,8 @@
     cmdAsCtrl: store.get('cmdAsCtrl') !== '0',
     showStats: store.get('showStats') === '1',
     autoFullscreen: store.get('autoFullscreen') !== '0',
-    sharpMotion: store.get('sharpMotion') === '1',   // never send moving content at half size
+    // How to send moving content (scrolling, dragging): auto, or always sharp / normal / light.
+    motion: store.get('motion') || (store.get('sharpMotion') === '1' ? 'normal' : 'auto'),
   };
 
   let ws = null;
@@ -90,10 +91,10 @@
   }
 
   function sendHi() {
-    // scale: 1 tells the PC this page stretches half-size updates back to full size, so it may
-    // send moving content that way when the connection is slow ("Sharp while moving" says no).
+    // scale: 1 tells the PC this page stretches half-size updates back to full size;
+    // motion is the "While moving" setting.
     send({ t: 'hi', vw: innerWidth, vh: innerHeight, sw: screen.width, sh: screen.height,
-           dpr: devicePixelRatio || 1, scale: opts.sharpMotion ? 0 : 1 });
+           dpr: devicePixelRatio || 1, scale: 1, motion: opts.motion });
   }
 
   function connect() {
@@ -373,7 +374,7 @@
   // Hardware keyboard: forward physical key codes; Windows applies its own layout/IME.
   const heldKeys = new Set();
   const MODIFIERS = /^(Shift|Control|Alt|Meta)(Left|Right)$/;
-  const isTyping = (t) => t instanceof Element && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA');
+  const isTyping = (t) => t instanceof Element && ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName);
   const mapCode = (code) => (opts.cmdAsCtrl && code.startsWith('Meta')) ? code.replace('Meta', 'Control') : code;
 
   function releaseKeys(filter = () => true) {
@@ -471,7 +472,13 @@
   bindToggle('opt-cmd', 'cmdAsCtrl', () => releaseKeys());
   bindToggle('opt-stats', 'showStats', () => { statsEl.hidden = !opts.showStats; });
   bindToggle('opt-fs', 'autoFullscreen', () => updateFullscreenUi());
-  bindToggle('opt-sharp', 'sharpMotion', () => sendHi());
+  const motionSelect = $('opt-motion');
+  motionSelect.value = opts.motion;
+  motionSelect.addEventListener('change', () => {
+    opts.motion = motionSelect.value;
+    store.set('motion', opts.motion);
+    sendHi();
+  });
   statsEl.hidden = !opts.showStats;
 
   // ----------------------------------------------------------- full screen
