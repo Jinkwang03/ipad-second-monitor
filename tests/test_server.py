@@ -22,14 +22,14 @@ KEY = "testkey"
 
 async def receive(ws, timeout):
     """Next message within `timeout` seconds, skipping cursor updates (test mode moves
-    a fake cursor constantly). Raises asyncio.TimeoutError if nothing else arrives."""
+    a fake cursor constantly) and delay reports. Raises asyncio.TimeoutError if nothing else arrives."""
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise asyncio.TimeoutError
         msg = await ws.receive(timeout=remaining)
-        if msg.type == aiohttp.WSMsgType.TEXT and json.loads(msg.data)["t"] in ("c", "cs"):
+        if msg.type == aiohttp.WSMsgType.TEXT and json.loads(msg.data)["t"] in ("c", "cs", "lat"):
             continue
         return msg
 

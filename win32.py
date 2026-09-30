@@ -299,6 +299,7 @@ class GdiCapture:
     """BitBlt a screen rectangle into a DIB section. Returns a fresh BGRX array per grab."""
 
     name = "GDI"
+    waits = False
 
     def __init__(self, rect):
         self.rect = rect
@@ -321,6 +322,7 @@ class GdiCapture:
                             self.screen_dc, self.left, self.top, SRCCOPY):
             raise OSError(f"BitBlt failed ({ctypes.get_last_error()})")
         gdi32.GdiFlush()
+        self.shown_at = time.perf_counter()
         return self.pixels.copy()
 
     def close(self) -> None:

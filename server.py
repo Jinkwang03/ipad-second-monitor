@@ -22,6 +22,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +42,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.4"
+VERSION = "1.5"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -55,6 +56,7 @@ RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10))
 MAX_INFLIGHT = 2        # frames sent but not yet drawn by the iPad; keeps latency low on slow Wi-Fi
 REFINE_DELAY = 0.3      # a region must be still this long before it is re-sent sharp
 SHARP_FRACTION = 0.12   # updates covering less of the screen than this are sent sharp right away
+HALF_SIZE_FRACTION = 0.25  # bigger moving areas go at half resolution (1/4 of the data) until still
 MONITOR_CHECK = 2.0     # seconds between checks for display changes
 CURSOR_HZ = 120
 
@@ -68,6 +70,7 @@ class Job:
     keyframe: bool
     new_size: bool
     target: capture.Target
+    shown_at: float = 0.0   # perf_counter time the PC drew this frame
 
 
 class Hub:
@@ -82,6 +85,7 @@ class Hub:
         self.target: capture.Target | None = None
         self.capture_name = ""
         self.frame: np.ndarray | None = None
+        self.frame_shown_at = 0.0                     # perf_counter time the PC drew self.frame
         self.last_change: np.ndarray | None = None   # per tile, monotonic time of last change
         self.generation = 0                           # bumped whenever the streamed display changes
         self.wake_capture = threading.Event()
@@ -205,11 +209,13 @@ class Hub:
                 source = prev = None
                 time.sleep(1.0)
                 continue
+            if img is None and getattr(source, "waits", False):
+                continue                       # grab() already waited; wait again for the next change
             if img is not None:
                 mask = tiles.diff_mask(prev, img)
                 prev = img
                 if mask.any():
-                    self._publish(img, mask, now)
+                    self._publish(img, mask, now, getattr(source, "shown_at", time.perf_counter()))
             delay = period - (time.monotonic() - now)
             if delay > 0:
                 time.sleep(delay)
@@ -232,11 +238,12 @@ class Hub:
                 log.info("No second display, so the iPad MIRRORS the main screen. To extend: %s", hint)
         self._call(self._wake_sessions)
 
-    def _publish(self, img: np.ndarray, mask: np.ndarray, now: float) -> None:
+    def _publish(self, img: np.ndarray, mask: np.ndarray, now: float, shown_at: float = 0.0) -> None:
         with self.lock:
             if self.last_change is None or self.last_change.shape != mask.shape:
                 return
             self.frame = img
+            self.frame_shown_at = shown_at or time.perf_counter()
             self.last_change[mask] = now
             for s in self.sessions:
                 if s.dirty is not None and s.dirty.shape == mask.shape:
@@ -264,24 +271,27 @@ class Hub:
                 mask = s.dirty
             s.dirty = np.zeros(grid, bool)
             refine = s.lowq & ~mask & ((now - self.last_change) > REFINE_DELAY)
-            frame, target = self.frame, self.target
+            frame, target, shown_at = self.frame, self.target, self.frame_shown_at
         if not mask.any() and not refine.any():
             return None
         sharp = keyframe or mask.mean() <= SHARP_FRACTION
         s.lowq[mask] = not sharp
         s.lowq[refine] = False
-        return Job(frame, mask, refine, sharp, keyframe, new_size, target)
+        return Job(frame, mask, refine, sharp, keyframe, new_size, target, shown_at)
 
     async def encode(self, job: Job):
         w, h = job.target.rect[2:]
         q_sharp, q_motion = self.args.quality, self.args.motion_quality
-        work = [(r, q_sharp if job.sharp else q_motion, job.sharp)
+        # Big moving areas (scrolling, dragging, video) go at half size: a quarter of the data
+        # to send and decode, so they keep up. They're re-sent sharp once they stop moving.
+        half = not job.sharp and job.mask.mean() > HALF_SIZE_FRACTION
+        work = [(r, q_sharp if job.sharp else q_motion, job.sharp, half)
                 for r in tiles.split_bands(tiles.mask_to_rects(job.mask, w, h))]
-        work += [(r, q_sharp, True) for r in tiles.split_bands(tiles.mask_to_rects(job.refine, w, h))]
+        work += [(r, q_sharp, True, False) for r in tiles.split_bands(tiles.mask_to_rects(job.refine, w, h))]
         loop = asyncio.get_running_loop()
-        datas = await asyncio.gather(*(loop.run_in_executor(self.pool, tiles.encode_jpeg, job.frame, r, q, sharp)
-                                       for r, q, sharp in work))
-        return [(r, data) for (r, _, _), data in zip(work, datas)]
+        datas = await asyncio.gather(*(loop.run_in_executor(self.pool, tiles.encode_jpeg, job.frame, *item)
+                                       for item in work))
+        return [(item[0], data) for item, data in zip(work, datas)]
 
     def size_message(self, target: capture.Target) -> dict:
         w, h = target.rect[2:]
@@ -394,6 +404,10 @@ class Session:
         self.cursor_pending: dict | None = None
         self.shapes_sent: set[int] = set()
         self.greeted = False
+        self.drawn_at: dict[int, float] = {}   # frame id -> when the PC drew what it shows
+        self.delays: deque[float] = deque(maxlen=30)
+        self.rtt = 0.0                          # network round trip, measured by the iPad
+        self.last_delay_report = 0.0
 
     async def send_json(self, obj) -> None:
         if not self.ws.closed:
@@ -429,6 +443,10 @@ class Session:
             parts = await hub.encode(job)
             flags = (tiles.FLAG_KEYFRAME if job.keyframe else 0) | (tiles.FLAG_SHARP if job.sharp else 0)
             self.frame_id = (self.frame_id + 1) & 0xFFFFFFFF
+            if not job.keyframe and job.mask.any():   # new content (not a resend): measure its delay
+                self.drawn_at[self.frame_id] = job.shown_at
+                if len(self.drawn_at) > 64:
+                    self.drawn_at.pop(next(iter(self.drawn_at)))
             self.inflight += 1
             await self.ws.send_bytes(tiles.pack_frame(self.frame_id, parts, flags))
 
@@ -456,6 +474,7 @@ class Session:
             self.inflight = max(0, self.inflight - 1)
             self.last_ack = time.monotonic()
             self.wake.set()
+            self._note_delay(self.drawn_at.pop(m.get("id"), None))
         elif t == "p" and injector:
             pos = hub.to_screen(m["x"], m["y"])
             if pos:
@@ -472,9 +491,22 @@ class Session:
             self.want_keyframe = True
             self.wake.set()
         elif t == "ping":
+            self.rtt = max(0.0, float(m.get("rtt") or 0) / 1000)
             asyncio.ensure_future(self.send_json({"t": "pong", "ts": m.get("ts")}))
         elif t == "hi":
             self._greet(m)
+
+    def _note_delay(self, drawn_at: float | None) -> None:
+        """Screen-to-iPad delay: from the PC drawing a change to the iPad showing it."""
+        if not drawn_at:
+            return
+        # The ack left the iPad right after drawing, and took about half a round trip to arrive.
+        self.delays.append(max(0.0, time.perf_counter() - drawn_at - self.rtt / 2))
+        now = time.monotonic()
+        if now - self.last_delay_report >= 1.0:
+            self.last_delay_report = now
+            ms = sorted(self.delays)[len(self.delays) // 2] * 1000
+            asyncio.ensure_future(self.send_json({"t": "lat", "ms": round(ms)}))
 
     def _greet(self, m: dict) -> None:
         dpr = float(m.get("dpr") or 1)

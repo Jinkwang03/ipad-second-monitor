@@ -35,7 +35,7 @@
   let drawChain = Promise.resolve();
   let streaming = false;
   let reconnectTimer = 0, reconnectDelay = 500, pingTimer = 0;
-  const stats = { frames: 0, bytes: 0, since: performance.now(), rtt: 0, text: '–' };
+  const stats = { frames: 0, bytes: 0, since: performance.now(), rtt: 0, delay: null, text: '–' };
 
   // ---------------------------------------------------------------- status
 
@@ -106,7 +106,7 @@
       reconnectDelay = 500;
       sendHi();
       clearInterval(pingTimer);
-      pingTimer = setInterval(() => send({ t: 'ping', ts: performance.now() }, sock), 2000);
+      pingTimer = setInterval(() => send({ t: 'ping', ts: performance.now(), rtt: stats.rtt }, sock), 2000);
       keepAwake();
     };
     sock.onmessage = (ev) => {
@@ -166,6 +166,9 @@
       case 'pong':
         stats.rtt = performance.now() - m.ts;
         break;
+      case 'lat':                            // screen-to-iPad delay measured by the PC
+        stats.delay = m.ms;
+        break;
       case 'offer':                          // files dropped on the PC's "Drop files here" box
         if (m.files && m.files.length) showInbox(null, m.files, 'Sent from the PC');
         break;
@@ -207,9 +210,10 @@
     let off = 8;
     for (let i = 0; i < count; i++) {
       const x = dv.getUint16(off, true), y = dv.getUint16(off + 2, true);
+      const w = dv.getUint16(off + 4, true), h = dv.getUint16(off + 6, true);
       const len = dv.getUint32(off + 8, true);
       off += 12;
-      rects.push({ x, y, blob: new Blob([new Uint8Array(buf, off, len)], { type: 'image/jpeg' }) });
+      rects.push({ x, y, w, h, blob: new Blob([new Uint8Array(buf, off, len)], { type: 'image/jpeg' }) });
       off += len;
     }
     stats.bytes += buf.byteLength;
@@ -218,7 +222,8 @@
     drawChain = drawChain                                           // ...but draw strictly in order
       .then(() => decoded)
       .then((images) => {
-        if (gen === sizeGen) images.forEach((img, i) => ctx.drawImage(img, rects[i].x, rects[i].y));
+        // Fast-moving areas arrive at half size; drawing into the full rectangle scales them back.
+        if (gen === sizeGen) images.forEach((img, i) => ctx.drawImage(img, rects[i].x, rects[i].y, rects[i].w, rects[i].h));
         images.forEach((img) => img.close && img.close());
         stats.frames++;
         if (!streaming && gen === sizeGen) { streaming = true; setStatus(null); }
@@ -700,7 +705,8 @@
 
   setInterval(() => {
     const now = performance.now(), dt = (now - stats.since) / 1000;
-    stats.text = `${Math.round(stats.frames / dt)} upd/s · ${formatRate(stats.bytes / dt)} · ${Math.round(stats.rtt)} ms`;
+    const delay = stats.delay === null ? '' : ` · delay ${stats.delay} ms`;
+    stats.text = `${Math.round(stats.frames / dt)} upd/s · ${formatRate(stats.bytes / dt)}${delay} · ping ${Math.round(stats.rtt)} ms`;
     stats.frames = 0;
     stats.bytes = 0;
     stats.since = now;

@@ -115,6 +115,7 @@ class PipelineTests(unittest.TestCase):
         self.session = server.Session(self.hub, FakeWebSocket(), "test")
         self.hub.sessions.add(self.session)
         self.canvas = None
+        self.half_sized = 0
 
     def pump(self):
         job = self.hub.take(self.session)
@@ -125,9 +126,12 @@ class PipelineTests(unittest.TestCase):
             w, h = job.target.rect[2:]
             self.canvas = np.zeros((h, w, 3), np.uint8)
         for (x, y, w, h), data in parts:
-            img = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
-            self.assertEqual(img.shape[:2], (h, w))
-            self.canvas[y:y + h, x:x + w] = img
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            if img.size != (w, h):              # big moving areas come at half size; stretch like the iPad
+                self.assertEqual(img.size, (w // 2, h // 2))
+                self.half_sized += 1
+                img = img.resize((w, h), Image.BILINEAR)
+            self.canvas[y:y + h, x:x + w] = np.asarray(img)
         return job
 
     def show(self, frame, prev):
@@ -158,16 +162,17 @@ class PipelineTests(unittest.TestCase):
             job = self.pump()
             self.assertFalse(job.sharp)
         self.assertTrue(self.session.lowq.all())
+        self.assertGreater(self.half_sized, 0)       # whole-screen motion went at half size
         self.assertIsNone(self.pump())               # nothing new, not still long enough yet
         motion_psnr = psnr(self.canvas, prev[..., 2::-1])
-        self.assertGreater(motion_psnr, 20)          # q60 4:2:0 on saturated random colour ~23 dB
+        self.assertGreater(motion_psnr, 12)          # blurry while moving (half size, q60)...
 
         self.hub.last_change -= 10                   # pretend the screen has been still for a while
         job = self.pump()
         self.assertTrue(job.refine.all() and not job.mask.any())
         self.assertFalse(self.session.lowq.any())
         refined_psnr = psnr(self.canvas, prev[..., 2::-1])
-        self.assertGreater(refined_psnr, 45)         # q90 4:4:4 ~53 dB
+        self.assertGreater(refined_psnr, 45)         # ...then sharp once still (q90 4:4:4 ~53 dB)
         self.assertIsNone(self.pump())
 
     def test_display_change_forces_keyframe(self):

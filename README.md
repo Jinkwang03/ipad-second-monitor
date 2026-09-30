@@ -238,9 +238,21 @@ run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi
 
 **The picture is blurry**: set the Windows display to the iPad's exact resolution with 200% scale (setup step 2).
 
-**Laggy or low frame rate**: use 5 GHz Wi-Fi and keep the laptop close to the router.
-Try `--motion-quality 50`. Moving content (video, fast scrolling) takes the most
-bandwidth, and still content costs almost nothing.
+**Laggy or low frame rate**
+- iPad Display doesn't go through the internet; the picture travels straight from the laptop
+  to the iPad over your Wi-Fi. To see how quick it is, open the menu and turn on
+  **Show stats on screen**:
+  - **delay** is the time from the PC drawing a change to the iPad showing it. Around
+    30–60 ms is normal.
+  - **ping** is the Wi-Fi's own share of that.
+- For the least lag:
+  - Use 5 GHz (or 6 GHz) Wi-Fi near the router, or the laptop's own Wi-Fi (the *iPad Display
+    (own Wi-Fi)* shortcut). That links the laptop and iPad directly, without a router in
+    between.
+  - Keep the laptop plugged in, or set Windows' power mode to *Best performance*. Battery
+    saving makes Wi-Fi respond in bursts.
+  - Set the virtual display to the iPad's own resolution (setup step 2), so nothing is scaled.
+  - On weak Wi-Fi, try `--motion-quality 50`.
 
 **The iPad screen turns off**: iPadOS doesn't let a plain web page keep the screen on.
 Set *Settings → Display & Brightness → Auto-Lock* to *Never* while you use it.
@@ -273,13 +285,14 @@ new version, change `VERSION` in `server.py`. Otherwise the current release is r
 
 ## How it works
 
-- **Capture**: DXGI Desktop Duplication (through `dxcam`) reads the chosen display only
-  when it changes, and falls back to GDI if that fails. The display is rechecked every
+- **Capture**: DXGI Desktop Duplication (through `dxcam`) waits for Windows to draw a change
+  and picks it up immediately, instead of checking on a timer. It falls back to GDI if that fails. The display is rechecked every
   2 s, so adding, removing or resizing it is handled live.
 - **Encoding**: frames are compared in 64 × 64 tiles. Only changed tiles are merged into
   rectangles and JPEG-encoded in parallel bands (libjpeg-turbo). Small changes like typing
   go out sharp right away (quality 90, full colour detail). Big changes like scrolling or
-  video go out lighter, then get re-sent sharp once they've been still for 0.3 s.
+  video go out lighter and at half resolution (a quarter of the data), then get re-sent
+  sharp once they've been still for 0.3 s.
 - **Flow control**: the iPad acknowledges each frame after drawing it, and the server
   keeps at most 2 frames in flight. A slow network means fewer updates rather than growing lag.
 - **Cursor**: sent separately as position plus shape, and drawn as an overlay on the iPad,
