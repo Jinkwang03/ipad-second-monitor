@@ -248,9 +248,10 @@ run.bat --monitor test         stream a synthetic test pattern (checks the Wi-Fi
   - **delay** is the time from the PC drawing a change to the iPad showing it. Around
     30–60 ms is normal.
   - **ping** is the Wi-Fi's own share of that.
-  - **moving: normal / light** shows how scrolling, dragging and video are being sent right
-    now. It's chosen automatically to keep delay and ping low. *light* (half resolution)
-    means your Wi-Fi can't carry full resolution without lag; the tips below help.
+  - **moving: light / normal** shows how scrolling, dragging and video are being sent right
+    now. It's chosen automatically for the least delay and ping. *light* (half resolution
+    while moving, sharp again once still) is the usual choice. *normal* (full resolution)
+    is used only when your Wi-Fi is fast enough that it adds no noticeable delay.
 - For the least lag:
   - Use 5 GHz (or 6 GHz) Wi-Fi near the router, or the laptop's own Wi-Fi (the *iPad Display
     (own Wi-Fi)* shortcut). That links the laptop and iPad directly, without a router in
@@ -302,13 +303,16 @@ new version, change `VERSION` in `server.py`. Otherwise the current release is r
 - **Encoding**: frames are compared in 64 × 64 tiles. Only changed tiles are merged into
   rectangles and JPEG-encoded in parallel bands (libjpeg-turbo). Small changes like typing
   go out sharp right away (quality 90, full colour detail). Big changes like scrolling or
-  video are chosen automatically, for the least delay and ping. They go at full resolution
-  (*normal*) while that keeps up, and at half resolution (*light*) as soon as the measured
-  delay passes ~70 ms or the ping rises. iPad Display goes back to *normal* only after 5 s of
-  keeping up (longer if it had to give up again), so it doesn't switch back and forth.
+  video are sent the way that gives the least delay and ping. They go at half resolution
+  (*light*) unless the Wi-Fi has shown for 5 s that it can carry a whole full-resolution
+  screen in ~25 ms, with moving updates arriving within ~40 ms and no rise in ping. Then
+  they go at full resolution (*normal*). Any sign of struggle switches back to *light* within
+  0.3 s. After such a failure, *normal* waits longer (up to a minute) before trying again,
+  so it doesn't switch back and forth.
   Areas that change many times a second (video, scrolling) keep one steady quality. They're
   re-sent sharp only once they have really stopped (about half a second), so a video never
-  blinks. Typing and clicks are always sent sharp.
+  blinks. Sharpening goes a few rows of tiles per update, so it never holds up a movement
+  that starts again. Typing and clicks are always sent sharp.
 - **Flow control**: the iPad acknowledges each frame after drawing it, and the server
   keeps at most 2 frames in flight. A slow network means fewer updates rather than growing lag.
 - **Cursor**: sent separately as position plus shape, and drawn as an overlay on the iPad,

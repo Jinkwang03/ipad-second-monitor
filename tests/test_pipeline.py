@@ -108,44 +108,43 @@ def make_hub(w=640, h=400):
 
 
 class MotionModeTests(unittest.TestCase):
-    """Moving content is sent at full size only while that keeps delay and ping low."""
-    PX = 2266 * 1488                               # the whole screen scrolling
+    """Moving content goes light (the least delay) unless full size clearly costs no delay."""
+    PX = 2266 * 1488                               # judged for a whole-screen update
 
     def desired(self, rate, delay=None, rtt=0.0, base_rtt=None):
         return server.desired_motion_mode(self.PX, rate, 0.2, delay, rtt, base_rtt)
 
-    def test_mode_follows_the_connection(self):
-        self.assertEqual(self.desired(None), "normal")             # nothing measured yet
-        self.assertEqual(self.desired(30e6), "normal")             # 674 KB in ~22 ms
-        self.assertEqual(self.desired(5e6), "light")               # too slow for full size
+    def test_light_unless_the_connection_is_clearly_fast(self):
+        self.assertEqual(self.desired(None), "light")              # nothing measured yet
+        self.assertEqual(self.desired(15e6), "light")              # ordinary Wi-Fi: 674 KB in ~45 ms
+        self.assertEqual(self.desired(40e6), "normal")             # fast: ~17 ms
+        self.assertEqual(self.desired(40e6, delay=0.030, rtt=0.004, base_rtt=0.003), "normal")
 
     def test_late_updates_or_a_rising_ping_mean_light(self):
-        self.assertEqual(self.desired(30e6, delay=0.090), "light")               # arriving late
-        self.assertEqual(self.desired(30e6, rtt=0.060, base_rtt=0.004), "light")  # Wi-Fi queueing
-        self.assertEqual(self.desired(30e6, delay=0.040, rtt=0.006, base_rtt=0.004), "normal")
+        self.assertEqual(self.desired(40e6, delay=0.060), "light")                # arriving late
+        self.assertEqual(self.desired(40e6, rtt=0.030, base_rtt=0.004), "light")  # Wi-Fi queueing
 
-    def test_goes_light_quickly_but_back_slowly(self):
+    def test_starts_light_goes_normal_slowly_and_back_quickly(self):
         auto = server.MotionMode()
-        self.assertEqual(auto.update("light", 0.0), "normal")
-        self.assertEqual(auto.update("light", 0.35), "light")      # struggling for 0.3 s: go light
-        self.assertEqual(auto.update("normal", 1.0), "light")
-        self.assertEqual(auto.update("normal", 5.5), "light")      # not yet 5 s of keeping up
-        self.assertEqual(auto.update("normal", 6.1), "normal")
+        self.assertEqual(auto.mode, "light")
+        self.assertEqual(auto.update("normal", 0.0), "light")
+        self.assertEqual(auto.update("normal", 4.9), "light")      # not yet 5 s of keeping up
+        self.assertEqual(auto.update("normal", 5.1), "normal")
+        self.assertEqual(auto.update("light", 6.0), "normal")
+        self.assertEqual(auto.update("light", 6.35), "light")      # struggling for 0.3 s: light
 
     def test_waits_longer_after_full_size_failed_again(self):
         auto = server.MotionMode()
-        auto.update("light", 0.0); auto.update("light", 0.4)       # light
-        auto.update("normal", 1.0); auto.update("normal", 6.1)     # back to normal at 6.1 s
-        auto.update("light", 7.0); auto.update("light", 7.4)       # ...but it failed right away
-        self.assertEqual(auto.mode, "light")
-        auto.update("normal", 8.0)
-        self.assertEqual(auto.update("normal", 13.1), "light")     # 5 s is no longer enough
-        self.assertEqual(auto.update("normal", 18.1), "normal")    # it now waits 10 s
+        auto.update("normal", 0.0); auto.update("normal", 5.1)     # normal at 5.1 s
+        auto.update("light", 6.0); auto.update("light", 6.4)       # ...but it failed right away
+        auto.update("normal", 7.0)
+        self.assertEqual(auto.update("normal", 12.1), "light")     # 5 s is no longer enough
+        self.assertEqual(auto.update("normal", 17.1), "normal")    # it now waits 10 s
 
     def test_never_flip_flops(self):
         auto = server.MotionMode()
-        seen = {auto.update("light" if i % 2 else "normal", i * 0.05) for i in range(400)}
-        self.assertEqual(seen, {"normal"})                          # a wobbly link never switches
+        seen = {auto.update("normal" if i % 2 else "light", i * 0.05) for i in range(400)}
+        self.assertEqual(seen, {"light"})                           # a wobbly link never switches
 
 
 class NeighborhoodTests(unittest.TestCase):
@@ -225,12 +224,39 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(motion_psnr, 12)          # blurry while moving (half size, q60)...
 
         self.hub.last_change -= 10                   # pretend the screen has been still for a while
-        job = self.pump()
-        self.assertTrue(job.refine.all() and not job.mask.any())
+        refined = np.zeros_like(self.session.lowq)
+        updates = 0
+        while (job := self.pump()) is not None:      # sharpened a few tiles per update, so a
+            self.assertFalse(job.mask.any())         # movement starting again isn't held up
+            self.assertLessEqual(int(job.refine.sum()), server.REFINE_TILES)
+            refined |= job.refine
+            updates += 1
+        self.assertTrue(refined.all() and updates == 2)   # 70 tiles: 64 + 6
         self.assertFalse(self.session.lowq.any())
         refined_psnr = psnr(self.canvas, prev[..., 2::-1])
         self.assertGreater(refined_psnr, 45)         # ...then sharp once still (q90 4:4:4 ~53 dB)
         self.assertIsNone(self.pump())
+
+    def test_sharpening_next_to_movement_is_kept_small(self):
+        prev = random_frame(400, 640, seed=3)
+        self.show(prev, None)
+        self.pump()
+        for i in range(3):                            # the whole screen moves (all 70 tiles soft)
+            frame = random_frame(400, 640, seed=30 + i)
+            self.show(frame, prev)
+            prev = frame
+            self.pump()
+        self.wait()                                   # it stops...
+        frame = prev.copy()                           # ...and a small area starts moving again
+        frame[0:64, 0:64, :3] = np.random.default_rng(1).integers(0, 256, (64, 64, 3))
+        for i in range(8):
+            frame = frame.copy()
+            frame[0:64, 0:64, :3] = np.random.default_rng(2 + i).integers(0, 256, (64, 64, 3))
+            self.show(frame, prev)
+            prev = frame
+            job = self.pump()
+        self.assertTrue(job.moving[0, 0])
+        self.assertLessEqual(int(job.refine.sum()), server.REFINE_TILES_MOVING)
 
     def test_a_playing_video_keeps_one_quality(self):
         # A video around 12% of the screen used to flip between sharp and soft every few frames,

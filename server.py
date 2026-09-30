@@ -45,7 +45,7 @@ if IS_WINDOWS:
     import win32
 
 log = logging.getLogger("ipad-display")
-VERSION = "1.9"
+VERSION = "1.9.1"
 FROZEN = getattr(sys, "frozen", False)   # running as the packaged iPadDisplay.exe
 WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "web"
 KEY_FILE = Path.home() / ".ipad-display-key"
@@ -58,14 +58,16 @@ RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10))
 
 MAX_INFLIGHT = 2        # frames sent but not yet drawn by the iPad; keeps latency low on slow Wi-Fi
 REFINE_DELAY = 0.2      # a region must be still this long before it is re-sent sharp
+REFINE_TILES = 64       # sharpen at most this many tiles per update (whole screen: a few updates),
+REFINE_TILES_MOVING = 16  # and fewer next to moving content, so sharpening never holds movement up
 SHARP_FRACTION = 0.12   # a sudden change bigger than this share of the screen is sent as moving first
 ACTIVITY_TAU = 0.5      # seconds over which a tile's "how often does it change" estimate fades
 BUSY_ACTIVITY = 6.0     # a tile (or a neighbour) changing ~12+ times a second is moving: video,
                         # scrolling. Typing, even fast, and a blinking caret stay below that.
 QUIET_RADIUS = 2        # sharpen a tile only once the tiles this close to it have stopped changing too
-MOTION_BUDGET = 0.045   # a full-size moving update should be drawn on the iPad within this long
-DELAY_LIMIT = 0.070     # moving updates taking longer than this (PC screen -> iPad) mean it's falling behind
-PING_LIMIT = 0.030      # a ping above this, and well above the usual, means the Wi-Fi is queueing up
+NORMAL_BUDGET = 0.025   # full size only if a whole-screen update would reach the iPad this fast,
+NORMAL_MAX_DELAY = 0.040  # moving updates currently arrive (PC screen -> iPad) within this,
+PING_LIMIT = 0.020      # and the ping stays low (under this, and near what this Wi-Fi does when idle)
 MOTION_DOWN_HOLD = 0.3  # moving content goes light after the connection has struggled for this long...
 MOTION_UP_HOLD = 5.0    # ...and back to full size only after it has kept up for this long
 MOTION_UP_HOLD_MAX = 60.0  # (longer each time full size had to be given up again soon after)
@@ -74,25 +76,36 @@ MONITOR_CHECK = 2.0     # seconds between checks for display changes
 CURSOR_HZ = 120
 
 
-def desired_motion_mode(changed_px: int, link_rate: float | None, bytes_per_px: float,
+def desired_motion_mode(screen_px: int, link_rate: float | None, bytes_per_px: float,
                         delay: float | None = None, rtt: float = 0.0, base_rtt: float | None = None) -> str:
-    """Full size ("normal") only if it keeps delay and ping low; otherwise half size ("light")."""
-    if delay is not None and delay > DELAY_LIMIT:
-        return "light"                          # moving updates already arrive late
-    if base_rtt is not None and rtt > max(PING_LIMIT, 2.5 * base_rtt):
-        return "light"                          # big updates are backing up the Wi-Fi
-    if link_rate is None:                       # nothing measured yet: assume a good connection
-        return "normal"
-    return "normal" if changed_px * bytes_per_px / link_rate <= MOTION_BUDGET else "light"
+    """Light (half size: the least delay and ping) unless full size ("normal") clearly costs no
+    noticeable delay on this connection. Judged for a whole-screen update, not the current one,
+    so updates of different sizes can't make the choice flip back and forth."""
+    if link_rate is None:
+        return "light"                          # nothing measured yet: start with the least delay
+    if delay is not None and delay > NORMAL_MAX_DELAY:
+        return "light"                          # moving updates already take too long
+    if base_rtt is not None and rtt > max(PING_LIMIT, 2 * base_rtt):
+        return "light"                          # the Wi-Fi is queueing up
+    return "normal" if screen_px * bytes_per_px / link_rate <= NORMAL_BUDGET else "light"
+
+
+def first_tiles(mask: np.ndarray, limit: int) -> np.ndarray:
+    """Keep only the first `limit` set tiles (top to bottom); the rest wait for a later update."""
+    if mask.sum() <= limit:
+        return mask
+    kept = np.zeros(mask.size, bool)
+    kept[np.flatnonzero(mask)[:limit]] = True
+    return kept.reshape(mask.shape)
 
 
 class MotionMode:
-    """Chooses how moving content is sent, keeping it steady: it goes light soon after the
-    connection struggles, and back to full size only after it has kept up for a while - longer
-    each time full size had to be given up again soon after, so it never bounces back and forth."""
+    """Chooses how moving content is sent, keeping it steady: it starts light, goes to full size
+    only after the connection has shown for a while that it can take it (longer each time full
+    size had to be given up again soon after), and back to light soon after it struggles."""
 
     def __init__(self):
-        self.mode = "normal"
+        self.mode = "light"
         self.wanted: str | None = None
         self.wanted_since = 0.0
         self.up_hold = MOTION_UP_HOLD
@@ -352,6 +365,7 @@ class Hub:
             calm = mask & ~moving
             if calm.mean() > SHARP_FRACTION:
                 moving |= calm
+        refine = first_tiles(refine, REFINE_TILES_MOVING if moving.any() else REFINE_TILES)
         s.lowq[mask] = moving[mask]
         s.lowq[refine] = False
         return Job(frame, mask, refine, not moving.any(), keyframe, new_size, target, shown_at, moving)
@@ -532,10 +546,11 @@ class Session:
             quality, half = None, False
             if not job.sharp:                      # moving content: full or half size, chosen automatically
                 changed_px = int(job.moving.sum()) * tiles.TILE ** 2
+                screen_px = job.target.rect[2] * job.target.rect[3]
                 recent = sorted(self.moving_delays)
                 delay = recent[len(recent) // 2] if len(recent) >= 5 else None
                 mode = self.motion_auto.update(
-                    desired_motion_mode(changed_px, self.link_rate, self.motion_bpp, delay, self.rtt, self.base_rtt),
+                    desired_motion_mode(screen_px, self.link_rate, self.motion_bpp, delay, self.rtt, self.base_rtt),
                     time.monotonic())
                 if mode == "light" and not self.can_scale:   # this page can't stretch half-size updates
                     mode = "normal"
@@ -612,9 +627,9 @@ class Session:
         if not sent:
             return
         sent_at, size = sent
-        # Leave out the round trip: it is the same for small and big updates, and counting it
-        # made small (light) updates look like a slow connection, which kept things light.
-        took = time.perf_counter() - sent_at - self.rtt
+        # Leave out the idle round trip (the same for small and big updates), but not any extra
+        # ping on top of it: that is Wi-Fi queueing, which is exactly a connection not keeping up.
+        took = time.perf_counter() - sent_at - (self.base_rtt or 0.0)
         if size >= 30_000 and took > 0.002:      # small updates say little about the connection
             rate = size / took
             self.link_rate = rate if self.link_rate is None else 0.8 * self.link_rate + 0.2 * rate
